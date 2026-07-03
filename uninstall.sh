@@ -13,8 +13,7 @@ set -eu
 
 REPO="${0:A:h}"
 WRAPPER="$REPO/llmeter-statusline.sh"
-SETTINGS="${LLMETER_SETTINGS:-$HOME/.claude/settings.json}"
-COMMAND="/bin/zsh $WRAPPER"
+SETTINGS="${LLMETER_SETTINGS:-${HOME:?llmeter: set HOME or LLMETER_SETTINGS}/.claude/settings.json}"
 PURGE="no"
 [ "${1:-}" = "--purge" ] && PURGE="yes"
 
@@ -23,17 +22,19 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-SETTINGS="$SETTINGS" COMMAND="$COMMAND" python3 - <<'PY'
-import json, os, shutil, sys, time
+WRAPPER="$WRAPPER" SETTINGS="$SETTINGS" python3 - <<'PY'
+import json, os, shlex, shutil, sys, time
 
-settings = os.environ["SETTINGS"]
-command  = os.environ["COMMAND"]
+# Resolve symlinks + build the command identically to install (quoted wrapper
+# path) so the "does this statusLine belong to llmeter?" comparison matches.
+settings = os.path.realpath(os.environ["SETTINGS"])
+command  = "/bin/zsh " + shlex.quote(os.environ["WRAPPER"])
 
 if not (os.path.exists(settings) and os.path.getsize(settings) > 0):
     print(f"llmeter: no settings file at {settings} — nothing to remove.")
     sys.exit(0)
 try:
-    with open(settings) as f:
+    with open(settings, encoding="utf-8-sig") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError("not an object")

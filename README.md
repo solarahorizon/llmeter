@@ -29,8 +29,8 @@ cd llmeter
 That's it. `install.sh` adds one key to `~/.claude/settings.json` (backing it up first, and validating the result), and Claude Code hot-reloads it. Send a message and the status line appears under your prompt.
 
 - **Idempotent** — safe to re-run.
-- **Non-destructive** — backs up your settings, refuses to touch a settings file it can't parse, and only ever adds/removes its own `statusLine` key.
-- **No hard-coded paths** — the wrapper locates itself, so the repo works wherever you cloned it.
+- **Non-destructive** — backs up your settings before writing, refuses to touch a settings file it can't parse, and notes any prior `statusLine` command it replaces (which stays in the backup).
+- **No hard-coded paths** — the wrapper locates itself, so the repo works wherever you cloned it (spaces in the path are fine).
 
 ## Verify it's working
 
@@ -74,11 +74,11 @@ Override the location with `LLMETER_DIR`.
 ## Uninstall
 
 ```bash
-./uninstall.sh            # remove the status line (restores from a backup key)
+./uninstall.sh            # remove llmeter's statusLine key (backs up first)
 ./uninstall.sh --purge    # also delete ~/.claude/llmeter/
 ```
 
-It only removes the `statusLine` key if it points at llmeter — a status line you set to something else is left alone.
+It only removes the `statusLine` key if it points at llmeter — a status line you set to something else is left alone. A full-file backup is written before any change.
 
 ## Requirements
 

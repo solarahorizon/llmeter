@@ -16,8 +16,7 @@ set -eu
 
 REPO="${0:A:h}"
 WRAPPER="$REPO/llmeter-statusline.sh"
-SETTINGS="${LLMETER_SETTINGS:-$HOME/.claude/settings.json}"
-COMMAND="/bin/zsh $WRAPPER"
+SETTINGS="${LLMETER_SETTINGS:-${HOME:?llmeter: set HOME or LLMETER_SETTINGS}/.claude/settings.json}"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "llmeter: python3 not found on PATH — it is required to run the status line." >&2
@@ -29,20 +28,26 @@ if [ ! -f "$WRAPPER" ]; then
 fi
 chmod +x "$WRAPPER" "$REPO/install.sh" "$REPO/uninstall.sh" 2>/dev/null || true
 
-REPO="$REPO" WRAPPER="$WRAPPER" SETTINGS="$SETTINGS" COMMAND="$COMMAND" python3 - <<'PY'
-import json, os, shutil, sys, time
+WRAPPER="$WRAPPER" SETTINGS="$SETTINGS" python3 - <<'PY'
+import glob, json, os, shlex, shutil, sys, time
 
-settings = os.environ["SETTINGS"]
-command  = os.environ["COMMAND"]
+# Resolve symlinks so a settings.json symlinked into a dotfiles repo is written
+# THROUGH the link (backup + write land on the real file; the link is kept).
+settings = os.path.realpath(os.environ["SETTINGS"])
+# Quote the wrapper path so a repo path containing spaces still yields a command
+# the shell parses as one argument. shlex.quote is a no-op for space-free paths,
+# so this stays byte-identical to older installs (uninstall must match exactly).
+command  = "/bin/zsh " + shlex.quote(os.environ["WRAPPER"])
 
 os.makedirs(os.path.dirname(settings), exist_ok=True)
 
-# Load existing settings (tolerate absent / empty; refuse to clobber a file we
-# cannot parse — better to stop than to destroy a hand-edited config).
+# Load existing settings (tolerate absent / empty / a UTF-8 BOM; refuse to
+# clobber a file we cannot parse — better to stop than destroy a hand-edited
+# config).
 data = {}
 if os.path.exists(settings) and os.path.getsize(settings) > 0:
     try:
-        with open(settings) as f:
+        with open(settings, encoding="utf-8-sig") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             print(f"llmeter: {settings} is not a JSON object — aborting, nothing changed.", file=sys.stderr)
@@ -60,11 +65,17 @@ existing = data.get("statusLine")
 if existing and existing.get("command") != command:
     print(f"llmeter: NOTE — replacing an existing statusLine command:\n    {existing.get('command')}")
 
-# Back up before writing (only when a real file exists).
+# Back up before writing (only when a real file exists), and prune old backups
+# so re-running the installer doesn't accumulate them without bound.
 if os.path.exists(settings) and os.path.getsize(settings) > 0:
     backup = f"{settings}.llmeter-bak-{int(time.time())}"
     shutil.copy2(settings, backup)
     print(f"llmeter: backed up existing settings -> {backup}")
+    for old in sorted(glob.glob(f"{settings}.llmeter-bak-*"))[:-5]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
 
 data["statusLine"] = desired
 
