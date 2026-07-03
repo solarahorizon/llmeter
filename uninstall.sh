@@ -23,7 +23,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 WRAPPER="$WRAPPER" SETTINGS="$SETTINGS" python3 - <<'PY'
-import json, os, shlex, shutil, sys, time
+import glob, json, os, shlex, shutil, sys, time
 
 # Resolve symlinks + build the command identically to install (quoted wrapper
 # path) so the "does this statusLine belong to llmeter?" comparison matches.
@@ -46,13 +46,19 @@ sl = data.get("statusLine")
 if not sl:
     print("llmeter: no statusLine key set — nothing to remove.")
     sys.exit(0)
-if sl.get("command") != command:
-    print("llmeter: the statusLine points at a DIFFERENT command — leaving it untouched:")
-    print(f"    {sl.get('command')}")
+if not isinstance(sl, dict) or sl.get("command") != command:
+    shown = sl.get("command") if isinstance(sl, dict) else sl
+    print("llmeter: the statusLine is not llmeter's — leaving it untouched:")
+    print(f"    {shown!r}")
     sys.exit(0)
 
 backup = f"{settings}.llmeter-bak-{int(time.time())}"
 shutil.copy2(settings, backup)
+for old in sorted(glob.glob(f"{settings}.llmeter-bak-*"))[:-5]:
+    try:
+        os.remove(old)
+    except OSError:
+        pass
 del data["statusLine"]
 
 tmp = settings + ".llmeter-tmp"

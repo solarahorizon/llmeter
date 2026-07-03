@@ -29,6 +29,7 @@ read defensively and never raise from the render path.
 import datetime
 import json
 import os
+import tempfile
 
 # Output dir is overridable so a caller can point it at another location
 # (e.g. a menu-bar consumer's dir, or a temp dir in tests).
@@ -84,10 +85,22 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
         except OSError:
             pass
 
-    tmp = snapshot_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(snap, f)
-    os.replace(tmp, snapshot_path)  # atomic: readers never see a partial file
+    # A UNIQUE temp file per writer (not a shared "<name>.tmp") so concurrent
+    # panes never clobber each other's in-flight write; os.replace is atomic, so
+    # a reader always sees a whole old-or-new file. (codex P2: a fixed temp path
+    # let two writers race and could promote malformed JSON.)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(snapshot_path),
+                               prefix=".usage-snapshot.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(snap, f)
+        os.replace(tmp, snapshot_path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return snap
 
 

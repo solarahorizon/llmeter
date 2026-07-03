@@ -62,8 +62,10 @@ if data.get("statusLine") == desired:
     sys.exit(0)
 
 existing = data.get("statusLine")
-if existing and existing.get("command") != command:
+if isinstance(existing, dict) and existing.get("command") != command:
     print(f"llmeter: NOTE — replacing an existing statusLine command:\n    {existing.get('command')}")
+elif existing is not None and not isinstance(existing, dict):
+    print(f"llmeter: NOTE — replacing a non-object statusLine value: {existing!r}")
 
 # Back up before writing (only when a real file exists), and prune old backups
 # so re-running the installer doesn't accumulate them without bound.

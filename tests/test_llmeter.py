@@ -69,6 +69,18 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(claude_code.parse(None)["caps"], {})
         self.assertEqual(claude_code.parse([1, 2])["caps"], {})
 
+    def test_parse_allowlists_cap_fields(self):
+        # Only known windows + fields are carried — unexpected metadata under
+        # rate_limits must never reach disk (privacy).
+        r = claude_code.parse({"rate_limits": {
+            "seven_day": {"used_percentage": 10.0, "resets_at": 123,
+                          "account_id": "SECRET", "plan": "max"},
+            "thirty_day": {"used_percentage": 5.0},   # unknown window -> dropped
+        }})
+        self.assertEqual(set(r["caps"]), {"seven_day"})
+        self.assertEqual(set(r["caps"]["seven_day"]), {"used_percentage", "resets_at"})
+        self.assertNotIn("account_id", r["caps"]["seven_day"])
+
 
 class HarvestTests(unittest.TestCase):
     def setUp(self):

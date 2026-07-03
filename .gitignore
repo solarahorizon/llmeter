@@ -7,6 +7,11 @@ __pycache__/
 # macOS
 .DS_Store
 
+# local review logs (never committed)
+.codex-review.log
+.codex*
+.deepseek*
+
 # llmeter runtime output (never belongs in the repo)
 usage-snapshot.json
 usage-history.jsonl
