@@ -83,7 +83,7 @@ It only removes the `statusLine` key if it points at llmeter — a status line y
 ## Requirements
 
 - **Claude Code** (v1). `wk %` needs a **Pro/Max** subscription.
-- **python3** and **zsh** — both ship with macOS. No pip installs, no dependencies (stdlib only).
+- **python3** and **zsh** — both ship with macOS (on Linux, install zsh; the command uses `/usr/bin/env zsh`). No pip installs, no dependencies (stdlib only).
 
 ## Roadmap — every AI CLI
 

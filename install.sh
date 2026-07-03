@@ -34,10 +34,11 @@ import glob, json, os, shlex, shutil, sys, time
 # Resolve symlinks so a settings.json symlinked into a dotfiles repo is written
 # THROUGH the link (backup + write land on the real file; the link is kept).
 settings = os.path.realpath(os.environ["SETTINGS"])
-# Quote the wrapper path so a repo path containing spaces still yields a command
-# the shell parses as one argument. shlex.quote is a no-op for space-free paths,
-# so this stays byte-identical to older installs (uninstall must match exactly).
-command  = "/bin/zsh " + shlex.quote(os.environ["WRAPPER"])
+# `/usr/bin/env zsh` (not a hard-coded /bin/zsh) so it finds zsh wherever it
+# lives (Linux/brew installs put it elsewhere). Quote the wrapper path so a repo
+# path with spaces still parses as one argument (shlex.quote is a no-op for
+# space-free paths). install + uninstall MUST build this identically.
+command  = "/usr/bin/env zsh " + shlex.quote(os.environ["WRAPPER"])
 
 os.makedirs(os.path.dirname(settings), exist_ok=True)
 
@@ -73,7 +74,12 @@ if os.path.exists(settings) and os.path.getsize(settings) > 0:
     backup = f"{settings}.llmeter-bak-{int(time.time())}"
     shutil.copy2(settings, backup)
     print(f"llmeter: backed up existing settings -> {backup}")
-    for old in sorted(glob.glob(f"{settings}.llmeter-bak-*"))[:-5]:
+    # Sort by the epoch in the filename (monotonic by construction) so the
+    # newest 5 are kept regardless of digit-count changes over time.
+    def _bak_epoch(p):
+        tail = p.rsplit(".llmeter-bak-", 1)[-1]
+        return int(tail) if tail.isdigit() else -1
+    for old in sorted(glob.glob(f"{settings}.llmeter-bak-*"), key=_bak_epoch)[:-5]:
         try:
             os.remove(old)
         except OSError:
@@ -81,8 +87,9 @@ if os.path.exists(settings) and os.path.getsize(settings) > 0:
 
 data["statusLine"] = desired
 
-# Atomic write, then re-parse to prove we produced valid JSON.
-tmp = settings + ".llmeter-tmp"
+# Atomic write, then re-parse to prove we produced valid JSON. A pid-unique
+# temp name avoids a collision if two installs ever run at once.
+tmp = f"{settings}.llmeter-tmp.{os.getpid()}"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
@@ -100,5 +107,5 @@ PY
 echo ""
 echo "llmeter installed. Start a new Claude Code session (or send a message) and"
 echo "look under the prompt for:  <model> · ctx N% · wk N% (resets …)"
-echo "Verify the capture:  cat ~/.claude/llmeter/usage-snapshot.json"
+echo "Verify the capture:  cat ${LLMETER_DIR:-$HOME/.claude/llmeter}/usage-snapshot.json"
 echo "Uninstall:  $REPO/uninstall.sh"

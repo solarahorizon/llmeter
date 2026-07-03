@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 # llmeter — Claude Code status-line command.
 #
 # Claude Code pipes a JSON payload to this script on every message; it prints

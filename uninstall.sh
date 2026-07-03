@@ -28,7 +28,7 @@ import glob, json, os, shlex, shutil, sys, time
 # Resolve symlinks + build the command identically to install (quoted wrapper
 # path) so the "does this statusLine belong to llmeter?" comparison matches.
 settings = os.path.realpath(os.environ["SETTINGS"])
-command  = "/bin/zsh " + shlex.quote(os.environ["WRAPPER"])
+command  = "/usr/bin/env zsh " + shlex.quote(os.environ["WRAPPER"])
 
 if not (os.path.exists(settings) and os.path.getsize(settings) > 0):
     print(f"llmeter: no settings file at {settings} — nothing to remove.")
@@ -54,14 +54,17 @@ if not isinstance(sl, dict) or sl.get("command") != command:
 
 backup = f"{settings}.llmeter-bak-{int(time.time())}"
 shutil.copy2(settings, backup)
-for old in sorted(glob.glob(f"{settings}.llmeter-bak-*"))[:-5]:
+def _bak_epoch(p):
+    tail = p.rsplit(".llmeter-bak-", 1)[-1]
+    return int(tail) if tail.isdigit() else -1
+for old in sorted(glob.glob(f"{settings}.llmeter-bak-*"), key=_bak_epoch)[:-5]:
     try:
         os.remove(old)
     except OSError:
         pass
 del data["statusLine"]
 
-tmp = settings + ".llmeter-tmp"
+tmp = f"{settings}.llmeter-tmp.{os.getpid()}"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")

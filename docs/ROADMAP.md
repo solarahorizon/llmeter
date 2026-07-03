@@ -70,6 +70,9 @@ the `cost`-not-`caps` half of the Reading earns its place.
   fresh, python3/zsh ok) in one command.
 - **Config file** — opt into showing the 5-hour window, cost, or per-model
   pools; choose separators/emoji.
+- **history rotation** — `usage-history.jsonl` appends only on a cap-% change
+  (a few lines/day), so it grows slowly, but a size/age cap (or monthly roll)
+  would keep it bounded for very heavy long-term use. (DeepSeek review, 07-03.)
 
 ## Non-goals
 
