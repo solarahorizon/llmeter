@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# llmeter runtime output (never belongs in the repo)
+usage-snapshot.json
+usage-history.jsonl
+*.llmeter-bak-*
+*.llmeter-tmp
