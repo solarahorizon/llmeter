@@ -9,6 +9,8 @@ Normalized Reading (what every adapter returns) — a plain dict::
         "source": "claude-code",          # which adapter produced this
         "model": "Opus 4.8 (1M context)", # display name, or None
         "context_pct": 30,                 # % of context window used, or None
+        "context_tokens": 205600,          # tokens currently in context, or None
+        "context_window_size": 1000000,    # model's max context tokens, or None
         "caps": {                          # subscription cap windows (may be {})
             "seven_day": {"used_percentage": 37, "resets_at": <epoch|iso>},
             "five_hour": {"used_percentage": 1,  "resets_at": <epoch|iso>},
@@ -148,8 +150,20 @@ def fmt_reset(epoch):
         return "?"
 
 
+def fmt_tokens(n):
+    """Compact token count: 618 · 9.5k · 206k · 1M."""
+    if n >= 1_000_000:
+        return "{:.1f}M".format(n / 1_000_000.0).replace(".0M", "M")
+    if n >= 10_000:
+        return "{:.0f}k".format(n / 1_000.0)
+    if n >= 1_000:
+        return "{:.1f}k".format(n / 1_000.0).replace(".0k", "k")
+    return "{:.0f}".format(n)
+
+
 def format_line(reading, snap=None):
-    """The visible status line: model · ctx N% · wk N% (reset) [· $cost].
+    """The visible status line: model · ctx N% (tokens/window) · wk N% (reset)
+    [· $cost].
 
     ``reading`` is this message's live reading (model + context + maybe caps).
     ``snap`` is the freshest persisted snapshot — used only to fill the
@@ -163,8 +177,18 @@ def format_line(reading, snap=None):
     if isinstance(model, str) and model:
         parts.append(model)
     ctx = reading.get("context_pct")
-    if isinstance(ctx, (int, float)):
-        parts.append("ctx {:.0f}%".format(ctx))
+    ctx_part = "ctx {:.0f}%".format(ctx) if isinstance(ctx, (int, float)) else None
+    # Absolute tokens ride along when the adapter surfaced them; 0 means "no
+    # API response yet this session" — suppress rather than show a noisy 0.
+    toks = reading.get("context_tokens")
+    if isinstance(toks, (int, float)) and not isinstance(toks, bool) and toks > 0:
+        detail = fmt_tokens(toks)
+        size = reading.get("context_window_size")
+        if isinstance(size, (int, float)) and not isinstance(size, bool) and size > 0:
+            detail += "/" + fmt_tokens(size)
+        ctx_part = "{} ({})".format(ctx_part, detail) if ctx_part else "ctx " + detail
+    if ctx_part:
+        parts.append(ctx_part)
 
     # Prefer this message's own caps; else the cross-window persisted snapshot.
     # Coerce every step to a dict — the host owns this schema and may hand us

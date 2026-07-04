@@ -11,7 +11,9 @@ Payload shape (Anthropic's, and theirs to change — read defensively)::
 
     { "session_id": "…",
       "model": {"id": "…", "display_name": "…"},
-      "context_window": {"used_percentage": 30},
+      "context_window": {"used_percentage": 30,
+                         "total_input_tokens": 295000,
+                         "context_window_size": 1000000},
       "rate_limits": {"five_hour": {"used_percentage", "resets_at"},
                       "seven_day": {"used_percentage", "resets_at"}} }
 """
@@ -57,10 +59,16 @@ def parse(data):
     if not isinstance(data, dict):
         data = {}
     model = core.dget(data, "model")
+    cw = core.dget(data, "context_window")
     return {
         "source": SOURCE,
         "model": model.get("display_name") or model.get("id"),
-        "context_pct": core.dget(data, "context_window").get("used_percentage"),
+        "context_pct": cw.get("used_percentage"),
+        # total_input_tokens is the exact sum used_percentage is computed from
+        # (input + cache_creation + cache_read); context_window_size is the
+        # model's max (200k, or 1M for extended-context models).
+        "context_tokens": cw.get("total_input_tokens"),
+        "context_window_size": cw.get("context_window_size"),
         "caps": _clean_caps(data.get("rate_limits")),
         "cost": None,
         "session_id": data.get("session_id"),

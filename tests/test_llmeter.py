@@ -59,6 +59,17 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(r["model"], "claude-x")
         self.assertEqual(r["caps"], {})
 
+    def test_parse_maps_context_tokens(self):
+        r = claude_code.parse({"context_window": {
+            "used_percentage": 20, "total_input_tokens": 205_600,
+            "context_window_size": 1_000_000}})
+        self.assertEqual(r["context_tokens"], 205_600)
+        self.assertEqual(r["context_window_size"], 1_000_000)
+        # Absent fields stay None, never raise.
+        r = claude_code.parse(PAYLOAD)
+        self.assertIsNone(r["context_tokens"])
+        self.assertIsNone(r["context_window_size"])
+
     def test_parse_hostile_shapes_never_raise(self):
         for bad in ({}, {"model": "a-string", "rate_limits": 5}, {"context_window": 3}):
             r = claude_code.parse(bad)
@@ -149,6 +160,27 @@ class RenderTests(unittest.TestCase):
         self.assertIn("wk 10%", line)
         self.assertIn("resets", line)
 
+    def test_format_line_absolute_tokens(self):
+        payload = {"model": {"display_name": "Fable 5"},
+                   "context_window": {"used_percentage": 20,
+                                      "total_input_tokens": 205_600,
+                                      "context_window_size": 1_000_000}}
+        self.assertIn("ctx 20% (206k/1M)",
+                      core.format_line(claude_code.parse(payload)))
+        # No window size -> tokens alone; no pct -> tokens still shown.
+        line = core.format_line({"context_tokens": 9_500})
+        self.assertIn("ctx 9.5k", line)
+        # 0 = pre-first-response -> suppressed, pct-only.
+        line = core.format_line({"context_pct": 12, "context_tokens": 0})
+        self.assertEqual(line, "ctx 12%")
+
+    def test_fmt_tokens(self):
+        for n, want in ((618, "618"), (1_500, "1.5k"), (9_000, "9k"),
+                        (94_000, "94k"), (205_600, "206k"),
+                        (200_000, "200k"), (1_000_000, "1M"),
+                        (1_500_000, "1.5M")):
+            self.assertEqual(core.fmt_tokens(n), want)
+
     def test_format_line_fail_soft(self):
         self.assertEqual(core.format_line({}, None), "llmeter")
         self.assertEqual(core.format_line(None, None), "llmeter")
@@ -156,6 +188,12 @@ class RenderTests(unittest.TestCase):
     def test_format_line_hostile_shapes(self):
         self.assertEqual(core.format_line(
             {"model": 5, "context_pct": "x", "caps": 3}, {"caps": 9}), "llmeter")
+        # Hostile shapes in the new token fields must not raise or render junk.
+        self.assertEqual(core.format_line(
+            {"context_pct": 12, "context_tokens": "junk",
+             "context_window_size": []}), "ctx 12%")
+        self.assertEqual(core.format_line(
+            {"context_tokens": True, "context_window_size": True}), "llmeter")
 
     def test_format_line_cost_only(self):
         # A pay-per-token reading (v2 shape) renders $ instead of a cap.

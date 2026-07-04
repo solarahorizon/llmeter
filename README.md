@@ -3,7 +3,7 @@
 An ambient **usage meter for AI coding CLIs**. It shows — right under your prompt — which model you're on, how full your context window is, and **how much of your weekly plan you've burned**:
 
 ```
-Opus 4.8 (1M context) · ctx 30% · wk 37% (resets Tue 10:00)
+Opus 4.8 (1M context) · ctx 30% (295k/1M) · wk 37% (resets Tue 10:00)
 ```
 
 It costs **zero tokens, zero network, ~20 ms** per message, and it quietly saves the real usage numbers to disk so you can chart them later.
