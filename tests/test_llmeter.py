@@ -104,6 +104,17 @@ class HarvestTests(unittest.TestCase):
         return core.write_snapshot(claude_code.parse(payload),
                                    self.snap, self.hist, now=now)
 
+    def test_snapshot_allowlists_reading_fields(self):
+        # A rogue/unknown Reading field must never reach disk (codex P2 —
+        # CONTRIBUTING ground rule 3: persisted fields are explicitly
+        # allowlisted, never dict(reading) wholesale).
+        reading = claude_code.parse(PAYLOAD)
+        reading["rogue_field"] = {"account_email": "leak@example.com"}
+        core.write_snapshot(reading, self.snap, self.hist)
+        on_disk = _json(self.snap)
+        self.assertNotIn("rogue_field", on_disk)
+        self.assertEqual(on_disk["caps"]["seven_day"]["used_percentage"], 10.0)
+
     def test_writes_snapshot_and_history(self):
         snap = self._write(PAYLOAD)
         self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 10.0)

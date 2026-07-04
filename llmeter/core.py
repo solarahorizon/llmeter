@@ -57,14 +57,22 @@ def _has_usable_data(reading):
     return isinstance(reading, dict) and (reading.get("caps") or reading.get("cost"))
 
 
+# The ONLY Reading fields that ever reach disk (CONTRIBUTING ground rule 3):
+# every persisted field is explicitly allowlisted, so an adapter (or a future
+# Reading extension) can never silently widen what lands in ~/.claude/llmeter/.
+_SNAPSHOT_FIELDS = ("source", "model", "context_pct", "context_tokens",
+                    "context_window_size", "caps", "cost", "session_id")
+
+
 def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     """Persist a normalized Reading. Returns the stored snapshot dict, or None
     if the reading carries no account-level usage worth persisting (e.g. a
     tool's first message before any usage is known).
 
     - The snapshot is the account-level truth used for cross-window fallback,
-      so we persist only when ``caps`` or ``cost`` is present (context % is
-      per-session and not persisted).
+      so we persist only when ``caps`` or ``cost`` is present.
+    - Only ``_SNAPSHOT_FIELDS`` are written — a field not on that allowlist
+      never reaches disk, whatever an adapter puts in the Reading.
     - Write is atomic (tmp + os.replace) so a concurrent reader never sees a
       torn file — multiple CLI panes may write these same files at once.
     - History appends one line only when a cap percentage actually changes
@@ -74,7 +82,7 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     history_path = history_path or HISTORY_PATH
     if not _has_usable_data(reading):
         return None
-    snap = dict(reading)
+    snap = {k: reading[k] for k in _SNAPSHOT_FIELDS if k in reading}
     snap["captured_at"] = now or now_iso()
     os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
 
