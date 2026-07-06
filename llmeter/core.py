@@ -87,11 +87,16 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
 
     prev = read_snapshot(snapshot_path, max_age_secs=None)
-    if _caps_changed((prev or {}).get("caps"), reading.get("caps")):
+    # Unconditional: {} is safer than leaving a hostile non-dict "caps" from
+    # the raw reading in the snapshot (deepseek review).
+    snap["caps"] = _merge_caps((prev or {}).get("caps"), snap.get("caps"))
+    # History logs the MERGED truth: a stale session re-publishing old numbers
+    # merges to no-change and appends nothing (no more flapping in the log).
+    if _caps_changed((prev or {}).get("caps"), snap.get("caps")):
         try:
             with open(history_path, "a") as f:
                 f.write(json.dumps({"captured_at": snap["captured_at"],
-                                    "caps": reading.get("caps") or {}}) + "\n")
+                                    "caps": snap.get("caps") or {}}) + "\n")
         except OSError:
             pass
 
@@ -114,13 +119,55 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     return snap
 
 
+def _merge_caps(prev_caps, new_caps):
+    """Merge cap windows so the snapshot is the account-level truth, not the
+    last writer's view. Idle CLI sessions re-publish their LAST-KNOWN caps on
+    every statusline refresh, so a session that has not called the API for
+    hours keeps stamping yesterday's percentage with a fresh captured_at —
+    last-writer-wins made the meter flap (69->82->69 within a minute, seen
+    live 2026-07-06). Per window: a later resets_at is a newer window and wins
+    outright; the SAME resets_at means the same window, where the account
+    percentage is monotonically non-decreasing -> keep the max."""
+    prev_caps = prev_caps if isinstance(prev_caps, dict) else {}
+    new_caps = new_caps if isinstance(new_caps, dict) else {}
+    merged = {}
+    for w in set(prev_caps) | set(new_caps):
+        old_w, new_w = prev_caps.get(w), new_caps.get(w)
+        old_ok = isinstance(old_w, dict) and isinstance(
+            old_w.get("used_percentage"), (int, float))
+        new_ok = isinstance(new_w, dict) and isinstance(
+            new_w.get("used_percentage"), (int, float))
+        if not old_ok and not new_ok:
+            continue  # neither side is a valid window: store nothing
+        if not old_ok or not new_ok:
+            merged[w] = new_w if new_ok else old_w
+            continue
+        old_r, new_r = old_w.get("resets_at"), new_w.get("resets_at")
+        old_num = isinstance(old_r, (int, float))
+        new_num = isinstance(new_r, (int, float))
+        if old_num and new_num and old_r != new_r:
+            merged[w] = new_w if new_r > old_r else old_w
+        elif old_num != new_num:
+            # Only one side is window-identified: it wins — otherwise a
+            # legacy/hostile entry with no resets_at but a higher % would
+            # block every future window forever (deepseek review).
+            merged[w] = new_w if new_num else old_w
+        else:
+            merged[w] = new_w if (new_w["used_percentage"]
+                                  >= old_w["used_percentage"]) else old_w
+    return merged
+
+
 def _caps_changed(prev_caps, new_caps):
-    prev_caps = prev_caps or {}
-    new_caps = new_caps or {}
-    return any(
-        (new_caps.get(w) or {}).get("used_percentage")
-        != (prev_caps.get(w) or {}).get("used_percentage")
-        for w in set(new_caps) | set(prev_caps))
+    prev_caps = prev_caps if isinstance(prev_caps, dict) else {}
+    new_caps = new_caps if isinstance(new_caps, dict) else {}
+
+    def _pct(caps, w):
+        v = caps.get(w)
+        return v.get("used_percentage") if isinstance(v, dict) else None
+
+    return any(_pct(new_caps, w) != _pct(prev_caps, w)
+               for w in set(new_caps) | set(prev_caps))
 
 
 def read_snapshot(path=None, max_age_secs=6 * 3600):

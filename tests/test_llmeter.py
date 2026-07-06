@@ -272,3 +272,68 @@ class MainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeCapsTests(unittest.TestCase):
+    """Idle sessions re-publish stale caps with fresh captured_at; the
+    snapshot must keep the per-window truth (2026-07-06 flapping bug)."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="llm-merge-")
+        self.addCleanup(shutil.rmtree, d)
+        self.snap = os.path.join(d, "s.json")
+        self.hist = os.path.join(d, "h.jsonl")
+
+    def _reading(self, pct, resets=1783468800):
+        return {"source": "claude-code", "model": "M",
+                "caps": {"seven_day": {"used_percentage": pct,
+                                       "resets_at": resets}}}
+
+    def _write(self, pct, resets=1783468800):
+        return core.write_snapshot(self._reading(pct, resets),
+                                   snapshot_path=self.snap,
+                                   history_path=self.hist)
+
+    def test_same_window_keeps_max(self):
+        self._write(82)
+        snap = self._write(58)  # stale session republishing yesterday's view
+        self.assertEqual(
+            snap["caps"]["seven_day"]["used_percentage"], 82)
+
+    def test_stale_republish_appends_no_history(self):
+        self._write(82)
+        self._write(58)
+        self._write(76)
+        lines = open(self.hist).read().strip().splitlines()
+        self.assertEqual(len(lines), 1)  # only the first real value logged
+
+    def test_new_window_wins_even_if_lower(self):
+        self._write(82, resets=1783468800)
+        snap = self._write(3, resets=1784073600)  # next week's window
+        self.assertEqual(
+            snap["caps"]["seven_day"]["used_percentage"], 3)
+
+    def test_hostile_prev_caps_shape(self):
+        core.write_snapshot({"source": "x", "model": "M", "caps":
+                             {"seven_day": "junk"}},
+                            snapshot_path=self.snap, history_path=self.hist)
+        snap = self._write(50)
+        self.assertEqual(
+            snap["caps"]["seven_day"]["used_percentage"], 50)
+
+    def test_legacy_entry_without_resets_cannot_block_new_window(self):
+        core.write_snapshot({"source": "x", "model": "M", "caps":
+                             {"seven_day": {"used_percentage": 90}}},
+                            snapshot_path=self.snap, history_path=self.hist)
+        snap = self._write(5, resets=1784073600)
+        self.assertEqual(
+            snap["caps"]["seven_day"]["used_percentage"], 5)
+
+    def test_junk_new_reading_keeps_valid_old(self):
+        self._write(82)
+        snap = core.write_snapshot({"source": "x", "model": "M",
+                                    "caps": {"seven_day": "junk"}},
+                                   snapshot_path=self.snap,
+                                   history_path=self.hist)
+        self.assertEqual(
+            snap["caps"]["seven_day"]["used_percentage"], 82)
