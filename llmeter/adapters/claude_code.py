@@ -18,6 +18,8 @@ Payload shape (Anthropic's, and theirs to change — read defensively)::
                       "seven_day": {"used_percentage", "resets_at"}} }
 """
 
+import os
+
 from .. import core
 
 SOURCE = "claude-code"
@@ -48,6 +50,36 @@ def _clean_caps(rl):
     return out
 
 
+def _ctx_window_int(v):
+    """Parse a context-window token count; None on anything unusable."""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _context_window_overrides():
+    """model id -> true context-window tokens, for custom models Claude Code
+    mis-sizes (it falls back to 200k for any model outside its own table).
+    Built-in defaults are merged under the LLMETER_CONTEXT_WINDOWS env var
+    ("id1=tokens1,id2=tokens2"); malformed entries are silently ignored so a
+    bad env value can never break the status line."""
+    overrides = {
+        # Custom models routed through a proxy: Claude Code reports 200k, the
+        # real window is larger. Add yours here, or set LLMETER_CONTEXT_WINDOWS.
+        "qwen3.8-max-preview": 1_000_000,
+    }
+    for chunk in os.environ.get("LLMETER_CONTEXT_WINDOWS", "").split(","):
+        if "=" not in chunk:
+            continue
+        mid, _, val = chunk.partition("=")
+        n = _ctx_window_int(val.strip())
+        if mid.strip() and n:
+            overrides[mid.strip()] = n
+    return overrides
+
+
 def parse(data):
     """Claude Code statusLine payload -> normalized Reading (see core).
 
@@ -60,7 +92,7 @@ def parse(data):
         data = {}
     model = core.dget(data, "model")
     cw = core.dget(data, "context_window")
-    return {
+    reading = {
         "source": SOURCE,
         "model": model.get("display_name") or model.get("id"),
         "context_pct": cw.get("used_percentage"),
@@ -73,3 +105,20 @@ def parse(data):
         "cost": None,
         "session_id": data.get("session_id"),
     }
+    # Custom-model context-window correction. Claude Code only knows the
+    # window of models in its own table; for everything else (e.g. a custom
+    # qwen routed through a proxy) it reports 200k. Substitute the real window
+    # and recompute the percentage from the absolute token count so the line
+    # (ctx% and tokens/window) stays internally consistent. Built-in defaults
+    # cover known custom models; extend per-user via LLMETER_CONTEXT_WINDOWS.
+    _ovs = _context_window_overrides()
+    _ov = _ovs.get(model.get("id")) or _ovs.get(model.get("display_name"))
+    if _ov:
+        _old = reading["context_window_size"]
+        _toks = reading["context_tokens"]
+        if isinstance(_toks, (int, float)) and not isinstance(_toks, bool) and _toks > 0:
+            reading["context_pct"] = min(100.0, _toks * 100.0 / _ov)
+        elif isinstance(reading["context_pct"], (int, float)) and isinstance(_old, (int, float)) and _old > 0:
+            reading["context_pct"] = reading["context_pct"] * _old / _ov
+        reading["context_window_size"] = _ov
+    return reading
