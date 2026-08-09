@@ -32,6 +32,7 @@ import datetime
 import json
 import os
 import tempfile
+import urllib.parse
 
 # Output dir is overridable so a caller can point it at another location
 # (e.g. a menu-bar consumer's dir, or a temp dir in tests).
@@ -39,6 +40,59 @@ DIR = os.environ.get("LLMETER_DIR") or os.path.join(
     os.path.expanduser("~"), ".claude", "llmeter")
 SNAPSHOT_PATH = os.path.join(DIR, "usage-snapshot.json")
 HISTORY_PATH = os.path.join(DIR, "usage-history.jsonl")
+
+# Hosts that are Anthropic's own API — pointing ANTHROPIC_BASE_URL at one of
+# these is still the default account, not a third party.
+_ANTHROPIC_HOSTS = frozenset(("api.anthropic.com",))
+DEFAULT_PROVIDER = "anthropic"
+
+
+def provider_key():
+    """Which API this session is pointed at, as a stable identity string.
+
+    A usage cap belongs to an ACCOUNT, not a machine. A session routed
+    elsewhere via ``ANTHROPIC_BASE_URL`` (an LLM gateway, or a vendor serving
+    an Anthropic-compatible endpoint) is spending a different account's quota,
+    so its numbers must never fill in for — or be merged into — the default
+    account's. Unset, blank, or Anthropic's own host all mean
+    ``DEFAULT_PROVIDER``, so an ordinary setup keeps exactly the paths and
+    behaviour it has today.
+
+    Claude Code applies a settings ``env`` block to the processes it spawns,
+    which is how a per-project base URL reaches the status line at all
+    (verified 2026-08-09 against Claude Code 2.1.226).
+    """
+    raw = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
+    if not raw:
+        return DEFAULT_PROVIDER
+    try:
+        host = urllib.parse.urlsplit(raw).hostname
+    except ValueError:  # malformed URL: treat as unroutable, never raise
+        return DEFAULT_PROVIDER
+    host = (host or "").strip().lower()
+    if not host or host in _ANTHROPIC_HOSTS:
+        return DEFAULT_PROVIDER
+    return host
+
+
+def _provider_slug(provider):
+    """Filesystem-safe form of a provider key."""
+    keep = "abcdefghijklmnopqrstuvwxyz0123456789.-_"
+    slug = "".join(c if c in keep else "-" for c in provider.lower())
+    return slug.strip("-.") or "unknown"
+
+
+def snapshot_path_for(provider=None):
+    """Snapshot path for a provider. The default account keeps the original
+    filename untouched, so existing readers of ``usage-snapshot.json`` see no
+    change; every other provider gets its own file. Separate files (rather
+    than one file with a provider field) mean the two accounts can never
+    overwrite or merge into each other, even when panes on both are live."""
+    provider = provider or provider_key()
+    if provider == DEFAULT_PROVIDER:
+        return SNAPSHOT_PATH
+    return os.path.join(DIR, "usage-snapshot.{}.json".format(
+        _provider_slug(provider)))
 
 
 def now_iso():
@@ -77,13 +131,20 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
       torn file — multiple CLI panes may write these same files at once.
     - History appends one line only when a cap percentage actually changes
       (the change-log a retrospective consumer joins against).
+    - Snapshots are per-provider: a session routed at another account writes
+      its own file and merges only against that file, so one account's cap can
+      never be folded into another's.
     """
-    snapshot_path = snapshot_path or SNAPSHOT_PATH
+    provider = provider_key()
+    snapshot_path = snapshot_path or snapshot_path_for(provider)
     history_path = history_path or HISTORY_PATH
     if not _has_usable_data(reading):
         return None
     snap = {k: reading[k] for k in _SNAPSHOT_FIELDS if k in reading}
     snap["captured_at"] = now or now_iso()
+    # Stamped by core, not copied from the Reading: the provider is a property
+    # of the environment the session runs in, not of anything an adapter parsed.
+    snap["provider"] = provider
     os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
 
     prev = read_snapshot(snapshot_path, max_age_secs=None)
@@ -96,6 +157,7 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
         try:
             with open(history_path, "a") as f:
                 f.write(json.dumps({"captured_at": snap["captured_at"],
+                                    "provider": provider,
                                     "caps": snap.get("caps") or {}}) + "\n")
         except OSError:
             pass
@@ -174,8 +236,12 @@ def read_snapshot(path=None, max_age_secs=6 * 3600):
     """Latest persisted snapshot, or None if absent/malformed/older than
     max_age_secs (None = no age limit). Adds ``age_secs`` for freshness
     labels. A tz-naive ``captured_at`` is treated as local time, never raised
-    on."""
-    path = path or SNAPSHOT_PATH
+    on.
+
+    With no explicit path this reads the CURRENT provider's snapshot, so a
+    session routed at another account never borrows the default account's
+    numbers."""
+    path = path or snapshot_path_for()
     try:
         with open(path) as f:
             snap = json.load(f)

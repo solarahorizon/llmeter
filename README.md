@@ -67,9 +67,22 @@ Terminal-independent: works identically under Terminal.app, iTerm2, tmux, VS Cod
 | File | What |
 |---|---|
 | `~/.claude/llmeter/usage-snapshot.json` | Latest capture (atomic overwrite) — model, context %, cap windows. |
-| `~/.claude/llmeter/usage-history.jsonl` | Append-only log, one line whenever a cap % changes — chart your week. |
+| `~/.claude/llmeter/usage-snapshot.<host>.json` | Same, for a session routed at a non-Anthropic endpoint. One file per provider. |
+| `~/.claude/llmeter/usage-history.jsonl` | Append-only log, one line whenever a cap % changes — chart your week. Each row carries its `provider`. |
 
 Override the location with `LLMETER_DIR`.
+
+### Sessions routed elsewhere
+
+If a project points Claude Code at another endpoint with `ANTHROPIC_BASE_URL`
+(an LLM gateway, or a vendor serving an Anthropic-compatible API), that session
+is spending a **different account's** quota. llmeter keeps each provider's
+usage in its own file and never lets one stand in for another.
+
+The visible effect: such a session shows `ctx` but no `wk` until that endpoint
+reports a cap of its own. That is deliberate. A cap borrowed from your
+Anthropic account, displayed under a third-party model's name, is a confident
+wrong number — and this tool exists to show you the real one.
 
 ## Uninstall
 

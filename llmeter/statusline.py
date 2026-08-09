@@ -9,6 +9,15 @@ host prompt is never broken.
 When a payload lacks caps (a fresh window before its first API response), the
 account-level cap is filled from the freshest snapshot any window persisted —
 the weekly cap is account-wide, so last-writer-wins is correct.
+
+"Account-wide" holds only WITHIN one provider. A session pointed elsewhere by
+``ANTHROPIC_BASE_URL`` spends a different account's quota, so snapshots are
+stored per provider and this fallback reads only the current one. Such a
+session shows no ``wk`` field until its own endpoint reports a cap, which is
+the honest answer: the alternative was showing the default account's
+percentage under the third-party model's name (seen live 2026-08-09 — a Qwen
+session displayed "wk 42%" while that vendor's quota was exhausted and
+returning 429s).
 """
 
 import json

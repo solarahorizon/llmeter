@@ -337,3 +337,148 @@ class MergeCapsTests(unittest.TestCase):
                                    history_path=self.hist)
         self.assertEqual(
             snap["caps"]["seven_day"]["used_percentage"], 82)
+
+
+class ProviderScopeTests(unittest.TestCase):
+    """A usage cap belongs to an account, not a machine.
+
+    Live bug, 2026-08-09: one project routed at Alibaba via ANTHROPIC_BASE_URL
+    showed "qwen3.8-max · wk 42%" — the 42% was the DEFAULT account's weekly,
+    borrowed from the shared snapshot, while the vendor's own quota was
+    exhausted and returning 429s. A confident number from the wrong account is
+    worse than no number, so the cap is now scoped per provider.
+    """
+
+    ALIYUN = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="llmeter-provider-")
+        self.addCleanup(shutil.rmtree, d)
+        self.dir = d
+        self.snap = os.path.join(d, "usage-snapshot.json")
+        self.hist = os.path.join(d, "usage-history.jsonl")
+
+    @contextlib.contextmanager
+    def _env(self, base_url):
+        env = dict(os.environ)
+        env.pop("ANTHROPIC_BASE_URL", None)
+        if base_url:
+            env["ANTHROPIC_BASE_URL"] = base_url
+        with mock.patch.dict(os.environ, env, clear=True):
+            yield
+
+    def _run(self, payload):
+        from llmeter import statusline
+        out = io.StringIO()
+        with mock.patch.object(core, "DIR", self.dir), \
+             mock.patch.object(core, "SNAPSHOT_PATH", self.snap), \
+             mock.patch.object(core, "HISTORY_PATH", self.hist), \
+             mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(out):
+            statusline.main()
+        return out.getvalue().strip()
+
+    # --- provider_key ---------------------------------------------------
+    def test_unset_or_blank_base_url_is_the_default_provider(self):
+        for value in (None, "", "   "):
+            with self._env(value):
+                self.assertEqual(core.provider_key(), core.DEFAULT_PROVIDER)
+
+    def test_anthropics_own_host_is_the_default_provider(self):
+        # Setting the canonical base URL explicitly must not split the cap.
+        with self._env("https://api.anthropic.com"):
+            self.assertEqual(core.provider_key(), core.DEFAULT_PROVIDER)
+
+    def test_third_party_host_is_its_own_provider(self):
+        with self._env(self.ALIYUN):
+            self.assertEqual(core.provider_key(),
+                             "token-plan.ap-southeast-1.maas.aliyuncs.com")
+
+    def test_provider_key_never_raises_on_junk(self):
+        for junk in ("not a url", "http://", "://///", "http://[oops"):
+            with self._env(junk):
+                self.assertIsInstance(core.provider_key(), str)
+
+    def test_case_and_port_do_not_split_a_provider(self):
+        with self._env("HTTPS://Gateway.Example.COM/v1"):
+            first = core.provider_key()
+        with self._env("https://gateway.example.com/other"):
+            self.assertEqual(core.provider_key(), first)
+
+    # --- snapshot paths -------------------------------------------------
+    def test_default_provider_keeps_the_original_filename(self):
+        # Existing consumers read usage-snapshot.json; that must not move.
+        with self._env(None), mock.patch.object(core, "SNAPSHOT_PATH", self.snap):
+            self.assertEqual(core.snapshot_path_for(), self.snap)
+
+    def test_third_party_gets_its_own_file(self):
+        with self._env(self.ALIYUN), mock.patch.object(core, "DIR", self.dir):
+            path = core.snapshot_path_for()
+        self.assertNotEqual(path, self.snap)
+        self.assertTrue(os.path.basename(path).startswith("usage-snapshot."))
+        self.assertTrue(path.endswith(".json"))
+
+    def test_provider_slug_is_filesystem_safe(self):
+        slug = core._provider_slug("Weird/Host:8080\\..")
+        self.assertNotIn("/", slug)
+        self.assertNotIn("\\", slug)
+        self.assertNotIn(":", slug)
+        self.assertTrue(slug)
+
+    # --- the regression --------------------------------------------------
+    def test_third_party_session_does_not_borrow_the_default_account_cap(self):
+        with self._env(None):
+            seeded = self._run(PAYLOAD)
+        self.assertIn("wk 10%", seeded)  # default account persisted its cap
+
+        with self._env(self.ALIYUN):
+            line = self._run({"model": {"display_name": "qwen3.8-max"},
+                              "context_window": {"used_percentage": 16}})
+        self.assertIn("qwen3.8-max", line)
+        self.assertIn("ctx 16%", line)
+        self.assertNotIn("wk", line)  # the whole point: no borrowed number
+
+    def test_same_provider_fallback_still_works(self):
+        # The cross-window fallback is the feature; only cross-PROVIDER is wrong.
+        with self._env(None):
+            self._run(PAYLOAD)
+            line = self._run({"model": {"display_name": "Opus 4.8"},
+                              "context_window": {"used_percentage": 16}})
+        self.assertIn("wk 10%", line)
+
+    def test_third_party_caps_never_land_in_the_default_snapshot(self):
+        with self._env(None):
+            self._run(PAYLOAD)
+        before = _json(self.snap)
+
+        vendor = json.loads(json.dumps(PAYLOAD))
+        vendor["rate_limits"]["seven_day"]["used_percentage"] = 99.0
+        vendor["model"]["display_name"] = "qwen3.8-max"
+        with self._env(self.ALIYUN):
+            self._run(vendor)
+
+        after = _json(self.snap)
+        self.assertEqual(after["caps"]["seven_day"]["used_percentage"],
+                         before["caps"]["seven_day"]["used_percentage"])
+        self.assertEqual(after["model"], "Fable 5")
+
+    def test_each_provider_keeps_its_own_cap(self):
+        vendor = json.loads(json.dumps(PAYLOAD))
+        vendor["rate_limits"]["seven_day"]["used_percentage"] = 99.0
+        with self._env(self.ALIYUN):
+            self._run(vendor)
+            line = self._run({"model": {"display_name": "qwen3.8-max"},
+                              "context_window": {"used_percentage": 16}})
+        self.assertIn("wk 99%", line)  # its OWN number, not the default's
+
+    def test_snapshot_and_history_record_the_provider(self):
+        with self._env(self.ALIYUN):
+            self._run(PAYLOAD)
+            path = None
+            with mock.patch.object(core, "DIR", self.dir):
+                path = core.snapshot_path_for()
+        self.assertEqual(_json(path)["provider"],
+                         "token-plan.ap-southeast-1.maas.aliyuncs.com")
+        row = json.loads(_lines(self.hist)[-1])
+        self.assertEqual(row["provider"],
+                         "token-plan.ap-southeast-1.maas.aliyuncs.com")
