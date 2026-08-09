@@ -45,6 +45,7 @@ HISTORY_PATH = os.path.join(DIR, "usage-history.jsonl")
 # Hosts that are Anthropic's own API — pointing ANTHROPIC_BASE_URL at one of
 # these is still the default account, not a third party.
 _ANTHROPIC_HOSTS = frozenset(("api.anthropic.com",))
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 DEFAULT_PROVIDER = "anthropic"
 
 
@@ -64,6 +65,32 @@ def _normalized_host(host):
     return host
 
 
+def _canonical_url(parts):
+    """One canonical string for an endpoint, or "" if unusable.
+
+    Every component that can select a different account is kept, and kept
+    UNAMBIGUOUSLY — the previous version glued host, port and path together,
+    which let distinct endpoints produce one key (codex P1): ``http://`` vs
+    ``https://``, ``?account=a`` vs ``?account=b``, and an IPv6 literal plus
+    port vs a longer IPv6 literal. Equivalences that are genuinely the same
+    endpoint are normalised away: case, the FQDN trailing dot, unicode via
+    IDNA, a scheme's default port, and a trailing slash on the path."""
+    scheme = (parts.scheme or "").strip().lower()
+    host = _normalized_host(parts.hostname)
+    if not host:
+        return ""
+    if ":" in host:  # IPv6 literal — keep the brackets so host:port can't blur
+        host = "[{}]".format(host)
+    port = parts.port
+    if port is not None and _DEFAULT_PORTS.get(scheme) == port:
+        port = None
+    netloc = host if port is None else "{}:{}".format(host, port)
+    url = "{}://{}{}".format(scheme, netloc, (parts.path or "").rstrip("/"))
+    if parts.query:
+        url += "?" + parts.query
+    return url
+
+
 def provider_key():
     """Which API this session is pointed at, as a stable identity string.
 
@@ -75,10 +102,15 @@ def provider_key():
     ``DEFAULT_PROVIDER``, so an ordinary setup keeps exactly the paths and
     behaviour it has today.
 
-    The identity is host + port + path, NOT host alone: a gateway routinely
-    multiplexes several upstreams off one hostname (``/provider-a`` vs
-    ``/provider-b``), and those are different accounts with different caps
-    (codex P1). Trailing slashes are stripped so ``/v1`` and ``/v1/`` agree.
+    The key is ``<readable label>#<digest>``. The label is the canonical URL
+    minus anything secret, so a human can tell whose file is whose; the digest
+    is over the canonical URL PLUS any userinfo, and is what actually makes
+    the identity injective.
+
+    Userinfo is deliberately kept out of the readable half: a gateway URL can
+    carry credentials, and llmeter's promise is that no credential reaches
+    disk. It still has to affect identity — ``alice:…@gw`` and ``bob:…@gw``
+    are different accounts — so it is folded into the one-way digest only.
 
     Claude Code applies a settings ``env`` block to the processes it spawns,
     which is how a per-project base URL reaches the status line at all
@@ -89,30 +121,33 @@ def provider_key():
         return DEFAULT_PROVIDER
     try:
         parts = urllib.parse.urlsplit(raw)
-        host = _normalized_host(parts.hostname)
-        port = parts.port
+        label = _canonical_url(parts)
+        userinfo = "{}:{}".format(parts.username or "", parts.password or "")
     except ValueError:  # malformed URL/port: unusable, never raise
         return DEFAULT_PROVIDER
-    if not host:
+    if not label:
         return DEFAULT_PROVIDER
-    path = (parts.path or "").rstrip("/")
-    if host in _ANTHROPIC_HOSTS:
+    if _normalized_host(parts.hostname) in _ANTHROPIC_HOSTS:
         return DEFAULT_PROVIDER
-    key = host if port is None else "{}:{}".format(host, port)
-    return key + path
+    digest = hashlib.sha256(
+        (label + "\x00" + userinfo).encode("utf-8")).hexdigest()[:16]
+    return "{}#{}".format(label, digest)
 
 
 def _provider_slug(provider):
-    """Filesystem-safe, length-bounded, collision-free filename fragment.
+    """Filesystem-safe, length-bounded filename fragment.
 
-    The readable part is best-effort for a human reading ``ls``; the digest is
-    what actually guarantees distinctness, so two providers can never share a
-    file no matter how the sanitiser mangles them, and a maximum-length
-    hostname can never blow the filesystem's name limit (codex P1/P3)."""
+    The readable part is best-effort for a human reading ``ls``; the 64-bit
+    digest is what separates two providers whose readable parts sanitise to
+    the same thing, and it bounds the name so a maximum-length hostname can
+    never blow the filesystem's limit (codex P1/P3). 64 bits makes an
+    accidental collision negligible rather than impossible — and a collision
+    here cannot expose the wrong cap regardless, because ``read_snapshot``
+    verifies the stamped provider before using a file's contents."""
     keep = "abcdefghijklmnopqrstuvwxyz0123456789.-_"
     readable = "".join(c if c in keep else "-" for c in provider.lower())
     readable = readable.strip("-.")[:48] or "provider"
-    digest = hashlib.sha256(provider.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(provider.encode("utf-8")).hexdigest()[:16]
     return "{}-{}".format(readable, digest)
 
 

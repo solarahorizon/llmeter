@@ -390,11 +390,13 @@ class ProviderScopeTests(unittest.TestCase):
             self.assertEqual(core.provider_key(), core.DEFAULT_PROVIDER)
 
     def test_third_party_host_is_its_own_provider(self):
-        # Identity is host + path: one gateway can front several accounts.
+        # Key is "<readable label>#<digest>": the label carries the canonical
+        # URL so a human can read it, the digest makes identity injective.
         with self._env(self.ALIYUN):
-            self.assertEqual(
-                core.provider_key(),
-                "token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic")
+            key = core.provider_key()
+        self.assertTrue(key.startswith(
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic#"),
+            key)
 
     def test_provider_key_never_raises_on_junk(self):
         for junk in ("not a url", "http://", "://///", "http://[oops"):
@@ -474,7 +476,8 @@ class ProviderScopeTests(unittest.TestCase):
         self.assertIn("wk 99%", line)  # its OWN number, not the default's
 
     def test_snapshot_and_history_record_the_provider(self):
-        expected = "token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
+        with self._env(self.ALIYUN):
+            expected = core.provider_key()
         with self._env(self.ALIYUN):
             self._run(PAYLOAD)
             with mock.patch.object(core, "DIR", self.dir), \
@@ -564,7 +567,11 @@ class ProviderScopeTests(unittest.TestCase):
     def test_slug_is_bounded_and_collision_free(self):
         long_host = ".".join(["averyverylongsubdomainlabel"] * 12) + ".example.com"
         slug = core._provider_slug(long_host)
-        self.assertLessEqual(len(slug), 64)
+        # What actually matters is that the FILENAME stays inside the 255-byte
+        # limit every common filesystem enforces, so persistence can't fail.
+        with mock.patch.object(core, "DIR", self.dir):
+            name = os.path.basename(core.snapshot_path_for(long_host))
+        self.assertLess(len(name.encode("utf-8")), 255)
         # Two hosts sharing a sanitised prefix must not share a file.
         a = core._provider_slug("a" * 60 + "-one")
         b = core._provider_slug("a" * 60 + "-two")
@@ -595,3 +602,66 @@ class ProviderScopeTests(unittest.TestCase):
         allowed = set(core._SNAPSHOT_FIELDS) | set(core._STAMPED_FIELDS)
         self.assertTrue(set(_json(self.snap)).issubset(allowed),
                         "a field reached disk that is on no allowlist")
+
+    # --- codex review round 2: identity must be injective ----------------
+    def _keys(self, *urls):
+        out = []
+        for u in urls:
+            with self._env(u):
+                out.append(core.provider_key())
+        return out
+
+    def test_scheme_is_part_of_the_identity(self):
+        a, b = self._keys("http://gateway.example.com/v1",
+                          "https://gateway.example.com/v1")
+        self.assertNotEqual(a, b)
+
+    def test_query_is_part_of_the_identity(self):
+        # A multi-tenant gateway may route by query string.
+        a, b = self._keys("https://gw.example.com/v1?account=a",
+                          "https://gw.example.com/v1?account=b")
+        self.assertNotEqual(a, b)
+
+    def test_userinfo_is_part_of_the_identity(self):
+        a, b = self._keys("https://alice:token-a@gw.example.com/v1",
+                          "https://bob:token-b@gw.example.com/v1")
+        self.assertNotEqual(a, b)
+
+    def test_userinfo_never_reaches_the_readable_key_or_disk(self):
+        # llmeter's promise is that no credential lands on disk. Userinfo may
+        # only influence the one-way digest.
+        with self._env("https://alice:s3cret-token@gw.example.com/v1"):
+            key = core.provider_key()
+            self._run(PAYLOAD)
+            with mock.patch.object(core, "DIR", self.dir):
+                path = core.snapshot_path_for()
+        self.assertNotIn("s3cret-token", key)
+        self.assertNotIn("alice", key)
+        self.assertNotIn("s3cret-token", path)
+        self.assertNotIn("s3cret-token", _read(path))
+
+    def test_ipv6_literal_and_port_cannot_blur(self):
+        a, b = self._keys("https://[2001:db8::1]:8443/v1",
+                          "https://[2001:db8::1:8443]/v1")
+        self.assertNotEqual(a, b)
+
+    def test_default_port_does_not_split_a_provider(self):
+        a, b = self._keys("https://gw.example.com/v1",
+                          "https://gw.example.com:443/v1")
+        self.assertEqual(a, b)
+        c, d = self._keys("http://gw.example.com/v1",
+                          "http://gw.example.com:80/v1")
+        self.assertEqual(c, d)
+
+    def test_non_default_port_still_splits(self):
+        a, b = self._keys("https://gw.example.com/v1",
+                          "https://gw.example.com:8443/v1")
+        self.assertNotEqual(a, b)
+
+    def test_scheme_variants_do_not_share_a_cap_end_to_end(self):
+        with self._env("https://gw.example.com/v1"):
+            self._run(PAYLOAD)
+        with self._env("http://gw.example.com/v1"):
+            line = self._run({"model": {"display_name": "other"},
+                              "context_window": {"used_percentage": 5}})
+        self.assertNotIn("wk", line)
