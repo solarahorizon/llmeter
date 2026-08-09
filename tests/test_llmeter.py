@@ -390,19 +390,21 @@ class ProviderScopeTests(unittest.TestCase):
             self.assertEqual(core.provider_key(), core.DEFAULT_PROVIDER)
 
     def test_third_party_host_is_its_own_provider(self):
+        # Identity is host + path: one gateway can front several accounts.
         with self._env(self.ALIYUN):
-            self.assertEqual(core.provider_key(),
-                             "token-plan.ap-southeast-1.maas.aliyuncs.com")
+            self.assertEqual(
+                core.provider_key(),
+                "token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic")
 
     def test_provider_key_never_raises_on_junk(self):
         for junk in ("not a url", "http://", "://///", "http://[oops"):
             with self._env(junk):
                 self.assertIsInstance(core.provider_key(), str)
 
-    def test_case_and_port_do_not_split_a_provider(self):
+    def test_case_does_not_split_a_provider(self):
         with self._env("HTTPS://Gateway.Example.COM/v1"):
             first = core.provider_key()
-        with self._env("https://gateway.example.com/other"):
+        with self._env("https://gateway.example.com/v1"):
             self.assertEqual(core.provider_key(), first)
 
     # --- snapshot paths -------------------------------------------------
@@ -472,13 +474,124 @@ class ProviderScopeTests(unittest.TestCase):
         self.assertIn("wk 99%", line)  # its OWN number, not the default's
 
     def test_snapshot_and_history_record_the_provider(self):
+        expected = "token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
         with self._env(self.ALIYUN):
             self._run(PAYLOAD)
-            path = None
-            with mock.patch.object(core, "DIR", self.dir):
-                path = core.snapshot_path_for()
-        self.assertEqual(_json(path)["provider"],
-                         "token-plan.ap-southeast-1.maas.aliyuncs.com")
-        row = json.loads(_lines(self.hist)[-1])
-        self.assertEqual(row["provider"],
-                         "token-plan.ap-southeast-1.maas.aliyuncs.com")
+            with mock.patch.object(core, "DIR", self.dir), \
+                 mock.patch.object(core, "HISTORY_PATH", self.hist):
+                snap_path = core.snapshot_path_for()
+                hist_path = core.history_path_for()
+        self.assertEqual(_json(snap_path)["provider"], expected)
+        row = json.loads(_lines(hist_path)[-1])
+        self.assertEqual(row["provider"], expected)
+
+    # --- codex review round 1 -------------------------------------------
+    def test_same_host_different_routes_are_different_providers(self):
+        # [P1] A gateway multiplexes upstreams off one hostname. Host-only
+        # identity collided them, so A's cap surfaced as B's fallback.
+        with self._env("https://gateway.example.com/provider-a"):
+            a = core.provider_key()
+            a_path = core.snapshot_path_for()
+        with self._env("https://gateway.example.com/provider-b"):
+            b = core.provider_key()
+            b_path = core.snapshot_path_for()
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a_path, b_path)
+
+    def test_port_is_part_of_the_identity(self):
+        with self._env("https://gw.example.com:8443/v1"):
+            a = core.provider_key()
+        with self._env("https://gw.example.com:9443/v1"):
+            self.assertNotEqual(core.provider_key(), a)
+
+    def test_trailing_slash_and_fqdn_dot_do_not_split_a_provider(self):
+        with self._env("https://GW.Example.COM./v1/"):
+            a = core.provider_key()
+        with self._env("https://gw.example.com/v1"):
+            self.assertEqual(core.provider_key(), a)
+
+    def test_gateway_route_caps_stay_separate_end_to_end(self):
+        route_a = "https://gateway.example.com/provider-a"
+        route_b = "https://gateway.example.com/provider-b"
+        with self._env(route_a):
+            self._run(PAYLOAD)  # A persists wk 10%
+        with self._env(route_b):
+            line = self._run({"model": {"display_name": "B"},
+                              "context_window": {"used_percentage": 5}})
+        self.assertNotIn("wk", line)
+
+    def test_explicit_path_cannot_bypass_provider_isolation(self):
+        # [P2] read_snapshot(SNAPSHOT_PATH) reached the default account's file
+        # regardless of who was asking. The stamped provider is now verified.
+        with self._env(None):
+            self._run(PAYLOAD)
+        with self._env(self.ALIYUN):
+            self.assertIsNone(core.read_snapshot(self.snap, max_age_secs=None))
+        # ...and an explicit opt-out still allows deliberate inspection.
+        with self._env(self.ALIYUN):
+            forced = core.read_snapshot(self.snap, max_age_secs=None,
+                                        provider=False)
+        self.assertEqual(forced["caps"]["seven_day"]["used_percentage"], 10.0)
+
+    def test_legacy_snapshot_without_provider_reads_as_default_account(self):
+        # Migration: files written before this field existed were the default.
+        with self._env(None):
+            self._run(PAYLOAD)
+        legacy = _json(self.snap)
+        legacy.pop("provider", None)
+        with open(self.snap, "w") as f:
+            json.dump(legacy, f)
+        with self._env(None):
+            self.assertIsNotNone(core.read_snapshot(self.snap,
+                                                    max_age_secs=None))
+        with self._env(self.ALIYUN):
+            self.assertIsNone(core.read_snapshot(self.snap, max_age_secs=None))
+
+    def test_history_is_per_provider(self):
+        # [P2] A consumer predating this change must not read a third party's
+        # rows as the default account's cap changes.
+        with self._env(None):
+            self._run(PAYLOAD)
+        with self._env(self.ALIYUN):
+            vendor = json.loads(json.dumps(PAYLOAD))
+            vendor["rate_limits"]["seven_day"]["used_percentage"] = 99.0
+            self._run(vendor)
+        rows = [json.loads(l) for l in _lines(self.hist)]
+        self.assertTrue(rows)
+        for row in rows:  # default history stays purely default-account
+            self.assertEqual(row.get("provider"), core.DEFAULT_PROVIDER)
+
+    def test_slug_is_bounded_and_collision_free(self):
+        long_host = ".".join(["averyverylongsubdomainlabel"] * 12) + ".example.com"
+        slug = core._provider_slug(long_host)
+        self.assertLessEqual(len(slug), 64)
+        # Two hosts sharing a sanitised prefix must not share a file.
+        a = core._provider_slug("a" * 60 + "-one")
+        b = core._provider_slug("a" * 60 + "-two")
+        self.assertNotEqual(a, b)
+
+    def test_environment_switch_round_trip_restores_the_cap(self):
+        with self._env(None):
+            self._run(PAYLOAD)
+        with self._env(self.ALIYUN):
+            self._run({"model": {"display_name": "qwen3.8-max"},
+                       "context_window": {"used_percentage": 3}})
+        with self._env(None):  # back to the default account
+            line = self._run({"model": {"display_name": "Opus 4.8"},
+                              "context_window": {"used_percentage": 9}})
+        self.assertIn("wk 10%", line)
+
+    def test_two_distinct_third_parties_do_not_share(self):
+        with self._env("https://vendor-one.example.com"):
+            self._run(PAYLOAD)
+        with self._env("https://vendor-two.example.com"):
+            line = self._run({"model": {"display_name": "two"},
+                              "context_window": {"used_percentage": 4}})
+        self.assertNotIn("wk", line)
+
+    def test_persisted_fields_are_exactly_the_documented_set(self):
+        with self._env(None):
+            self._run(PAYLOAD)
+        allowed = set(core._SNAPSHOT_FIELDS) | set(core._STAMPED_FIELDS)
+        self.assertTrue(set(_json(self.snap)).issubset(allowed),
+                        "a field reached disk that is on no allowlist")

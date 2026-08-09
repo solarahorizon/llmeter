@@ -69,3 +69,8 @@ Include your OS, `python3 --version`, whether the status line renders at all,
 and (if safe to share) the contents of `~/.claude/llmeter/usage-snapshot.json`.
 Never paste anything you consider sensitive — though by design that file holds
 only usage numbers.
+
+One exception to "only usage numbers": if you set `ANTHROPIC_BASE_URL`, the
+snapshot's `provider` field and its filename record that endpoint's host and
+path, so llmeter can keep each account's cap separate. If that endpoint is an
+internal gateway, redact it before pasting.

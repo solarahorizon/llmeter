@@ -29,6 +29,7 @@ read defensively and never raise from the render path.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import tempfile
@@ -47,6 +48,22 @@ _ANTHROPIC_HOSTS = frozenset(("api.anthropic.com",))
 DEFAULT_PROVIDER = "anthropic"
 
 
+def _normalized_host(host):
+    """Lowercase, drop the FQDN trailing dot, IDNA-encode unicode. So
+    ``API.Example.COM.`` and ``api.example.com`` are one provider, not two."""
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    try:
+        host.encode("ascii")
+    except UnicodeEncodeError:
+        try:
+            host = host.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            pass  # unencodable: keep the raw form, still a stable key
+    return host
+
+
 def provider_key():
     """Which API this session is pointed at, as a stable identity string.
 
@@ -58,6 +75,11 @@ def provider_key():
     ``DEFAULT_PROVIDER``, so an ordinary setup keeps exactly the paths and
     behaviour it has today.
 
+    The identity is host + port + path, NOT host alone: a gateway routinely
+    multiplexes several upstreams off one hostname (``/provider-a`` vs
+    ``/provider-b``), and those are different accounts with different caps
+    (codex P1). Trailing slashes are stripped so ``/v1`` and ``/v1/`` agree.
+
     Claude Code applies a settings ``env`` block to the processes it spawns,
     which is how a per-project base URL reaches the status line at all
     (verified 2026-08-09 against Claude Code 2.1.226).
@@ -66,20 +88,32 @@ def provider_key():
     if not raw:
         return DEFAULT_PROVIDER
     try:
-        host = urllib.parse.urlsplit(raw).hostname
-    except ValueError:  # malformed URL: treat as unroutable, never raise
+        parts = urllib.parse.urlsplit(raw)
+        host = _normalized_host(parts.hostname)
+        port = parts.port
+    except ValueError:  # malformed URL/port: unusable, never raise
         return DEFAULT_PROVIDER
-    host = (host or "").strip().lower()
-    if not host or host in _ANTHROPIC_HOSTS:
+    if not host:
         return DEFAULT_PROVIDER
-    return host
+    path = (parts.path or "").rstrip("/")
+    if host in _ANTHROPIC_HOSTS:
+        return DEFAULT_PROVIDER
+    key = host if port is None else "{}:{}".format(host, port)
+    return key + path
 
 
 def _provider_slug(provider):
-    """Filesystem-safe form of a provider key."""
+    """Filesystem-safe, length-bounded, collision-free filename fragment.
+
+    The readable part is best-effort for a human reading ``ls``; the digest is
+    what actually guarantees distinctness, so two providers can never share a
+    file no matter how the sanitiser mangles them, and a maximum-length
+    hostname can never blow the filesystem's name limit (codex P1/P3)."""
     keep = "abcdefghijklmnopqrstuvwxyz0123456789.-_"
-    slug = "".join(c if c in keep else "-" for c in provider.lower())
-    return slug.strip("-.") or "unknown"
+    readable = "".join(c if c in keep else "-" for c in provider.lower())
+    readable = readable.strip("-.")[:48] or "provider"
+    digest = hashlib.sha256(provider.encode("utf-8")).hexdigest()[:12]
+    return "{}-{}".format(readable, digest)
 
 
 def snapshot_path_for(provider=None):
@@ -92,6 +126,17 @@ def snapshot_path_for(provider=None):
     if provider == DEFAULT_PROVIDER:
         return SNAPSHOT_PATH
     return os.path.join(DIR, "usage-snapshot.{}.json".format(
+        _provider_slug(provider)))
+
+
+def history_path_for(provider=None):
+    """History path for a provider. Split for the same reason as the
+    snapshot, and so a consumer written before this change never reads another
+    account's rows as if they were the default account's (codex P2)."""
+    provider = provider or provider_key()
+    if provider == DEFAULT_PROVIDER:
+        return HISTORY_PATH
+    return os.path.join(DIR, "usage-history.{}.jsonl".format(
         _provider_slug(provider)))
 
 
@@ -117,6 +162,14 @@ def _has_usable_data(reading):
 _SNAPSHOT_FIELDS = ("source", "model", "context_pct", "context_tokens",
                     "context_window_size", "caps", "cost", "session_id")
 
+# Written by core itself rather than copied from a Reading, so the allowlist
+# above still holds: no adapter can widen what is persisted. Listed explicitly
+# so "what reaches disk" stays answerable from one place (codex P2).
+# NOTE: `provider` records the HOST (and path) of a non-default
+# ANTHROPIC_BASE_URL. If that endpoint is an internal gateway, redact it before
+# pasting a snapshot into a bug report — see CONTRIBUTING.
+_STAMPED_FIELDS = ("captured_at", "provider")
+
 
 def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     """Persist a normalized Reading. Returns the stored snapshot dict, or None
@@ -137,7 +190,7 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     """
     provider = provider_key()
     snapshot_path = snapshot_path or snapshot_path_for(provider)
-    history_path = history_path or HISTORY_PATH
+    history_path = history_path or history_path_for(provider)
     if not _has_usable_data(reading):
         return None
     snap = {k: reading[k] for k in _SNAPSHOT_FIELDS if k in reading}
@@ -147,7 +200,9 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     snap["provider"] = provider
     os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
 
-    prev = read_snapshot(snapshot_path, max_age_secs=None)
+    # provider-checked: never merge another account's percentages into this
+    # one, even if both somehow resolved to the same file.
+    prev = read_snapshot(snapshot_path, max_age_secs=None, provider=provider)
     # Unconditional: {} is safer than leaving a hostile non-dict "caps" from
     # the raw reading in the snapshot (deepseek review).
     snap["caps"] = _merge_caps((prev or {}).get("caps"), snap.get("caps"))
@@ -232,7 +287,7 @@ def _caps_changed(prev_caps, new_caps):
                for w in set(new_caps) | set(prev_caps))
 
 
-def read_snapshot(path=None, max_age_secs=6 * 3600):
+def read_snapshot(path=None, max_age_secs=6 * 3600, provider=None):
     """Latest persisted snapshot, or None if absent/malformed/older than
     max_age_secs (None = no age limit). Adds ``age_secs`` for freshness
     labels. A tz-naive ``captured_at`` is treated as local time, never raised
@@ -240,8 +295,17 @@ def read_snapshot(path=None, max_age_secs=6 * 3600):
 
     With no explicit path this reads the CURRENT provider's snapshot, so a
     session routed at another account never borrows the default account's
-    numbers."""
+    numbers.
+
+    The stamped ``provider`` is then VERIFIED against the caller's, and a
+    mismatch reads as absent. Path separation alone was not enough: an
+    explicit ``path`` argument bypassed it entirely, and any future slug
+    collision would silently reopen the bug this fix exists to close (codex
+    P1/P2). A snapshot written before this field existed is treated as the
+    default account, which is what it was. Pass ``provider=False`` to skip the
+    check when deliberately inspecting another account's file."""
     path = path or snapshot_path_for()
+    want = provider_key() if provider is None else provider
     try:
         with open(path) as f:
             snap = json.load(f)
@@ -252,6 +316,12 @@ def read_snapshot(path=None, max_age_secs=6 * 3600):
             captured = captured.astimezone()
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    if want is not False:
+        stamped = snap.get("provider")
+        if not isinstance(stamped, str) or not stamped:
+            stamped = DEFAULT_PROVIDER  # pre-dates the field: it was the default
+        if stamped != want:
+            return None
     age = (datetime.datetime.now().astimezone() - captured).total_seconds()
     if max_age_secs is not None and age > max_age_secs:
         return None
