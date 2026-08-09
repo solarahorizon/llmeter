@@ -85,10 +85,13 @@ def _canonical_url(parts):
     if port is not None and _DEFAULT_PORTS.get(scheme) == port:
         port = None
     netloc = host if port is None else "{}:{}".format(host, port)
-    url = "{}://{}{}".format(scheme, netloc, (parts.path or "").rstrip("/"))
-    if parts.query:
-        url += "?" + parts.query
-    return url
+    return "{}://{}{}".format(scheme, netloc, (parts.path or "").rstrip("/"))
+
+
+def _utf8(s):
+    """Bytes for hashing that never raise on a lone surrogate — an env var can
+    hold anything, and losing persistence to a decode error is not fail-soft."""
+    return s.encode("utf-8", "surrogatepass")
 
 
 def provider_key():
@@ -103,18 +106,31 @@ def provider_key():
     behaviour it has today.
 
     The key is ``<readable label>#<digest>``. The label is the canonical URL
-    minus anything secret, so a human can tell whose file is whose; the digest
-    is over the canonical URL PLUS any userinfo, and is what actually makes
-    the identity injective.
+    with every secret-bearing part removed, so a human can tell whose file is
+    whose; the digest covers the label PLUS the userinfo and query, and is
+    what distinguishes endpoints the label deliberately cannot show.
 
-    Userinfo is deliberately kept out of the readable half: a gateway URL can
-    carry credentials, and llmeter's promise is that no credential reaches
-    disk. It still has to affect identity — ``alice:…@gw`` and ``bob:…@gw``
-    are different accounts — so it is folded into the one-way digest only.
+    Userinfo and the query string are kept out of the readable half because
+    both routinely carry credentials (``alice:token@gw``, ``?api_key=…``), and
+    llmeter's promise is that no credential reaches disk — not in a file, not
+    in a filename. They still must affect identity, since they can select
+    different accounts, so they are folded into the one-way digest only. (The
+    digest is a weak offline verifier for a guessable credential, but anyone
+    who can read it can already read the plaintext in your settings file.)
+
+    "Injective" here means over distinct ENDPOINTS, not over distinct URL
+    strings: forms that address the same endpoint — case, the FQDN trailing
+    dot, a scheme's default port, a trailing slash — are deliberately
+    normalised together, and Anthropic's own host is always the default
+    account whatever the scheme.
 
     Claude Code applies a settings ``env`` block to the processes it spawns,
     which is how a per-project base URL reaches the status line at all
     (verified 2026-08-09 against Claude Code 2.1.226).
+
+    Fail-soft: any unparseable or hostile value reads as the default account
+    rather than raising, because a status line that crashes is worse than one
+    that is conservative.
     """
     raw = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
     if not raw:
@@ -122,15 +138,15 @@ def provider_key():
     try:
         parts = urllib.parse.urlsplit(raw)
         label = _canonical_url(parts)
-        userinfo = "{}:{}".format(parts.username or "", parts.password or "")
-    except ValueError:  # malformed URL/port: unusable, never raise
+        if not label:
+            return DEFAULT_PROVIDER
+        if _normalized_host(parts.hostname) in _ANTHROPIC_HOSTS:
+            return DEFAULT_PROVIDER
+        secret = "{}:{}\x00{}".format(parts.username or "",
+                                      parts.password or "", parts.query or "")
+        digest = hashlib.sha256(_utf8(label + "\x00" + secret)).hexdigest()[:16]
+    except Exception:  # malformed URL, bad port, lone surrogate: stay usable
         return DEFAULT_PROVIDER
-    if not label:
-        return DEFAULT_PROVIDER
-    if _normalized_host(parts.hostname) in _ANTHROPIC_HOSTS:
-        return DEFAULT_PROVIDER
-    digest = hashlib.sha256(
-        (label + "\x00" + userinfo).encode("utf-8")).hexdigest()[:16]
     return "{}#{}".format(label, digest)
 
 
@@ -147,7 +163,7 @@ def _provider_slug(provider):
     keep = "abcdefghijklmnopqrstuvwxyz0123456789.-_"
     readable = "".join(c if c in keep else "-" for c in provider.lower())
     readable = readable.strip("-.")[:48] or "provider"
-    digest = hashlib.sha256(provider.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(_utf8(provider)).hexdigest()[:16]
     return "{}-{}".format(readable, digest)
 
 

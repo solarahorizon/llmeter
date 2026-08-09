@@ -665,3 +665,39 @@ class ProviderScopeTests(unittest.TestCase):
             line = self._run({"model": {"display_name": "other"},
                               "context_window": {"used_percentage": 5}})
         self.assertNotIn("wk", line)
+
+    # --- codex review round 3 --------------------------------------------
+    def test_query_secret_never_reaches_disk(self):
+        # A query string routinely carries credentials. It must still change
+        # identity, but must not appear in the key, the filename or the file.
+        url = "https://gw.example.com/v1?api_key=s3cret-value"
+        with self._env(url):
+            key = core.provider_key()
+            self._run(PAYLOAD)
+            with mock.patch.object(core, "DIR", self.dir):
+                path = core.snapshot_path_for()
+                hist = core.history_path_for()
+        for blob in (key, path, _read(path), _read(hist)):
+            self.assertNotIn("s3cret-value", blob)
+            self.assertNotIn("api_key", blob)
+
+    def test_query_still_separates_accounts(self):
+        a, b = self._keys("https://gw.example.com/v1?account=a",
+                          "https://gw.example.com/v1?account=b")
+        self.assertNotEqual(a, b)
+
+    def test_hostile_env_values_never_raise(self):
+        hostile = ["https://" + "\udcff" + ".example/v1", "https://gw.example:bad",
+                   "\udcff", "https://[oops", "://", "%%%", "https://" + "x" * 5000]
+        for value in hostile:
+            with self._env(value):
+                key = core.provider_key()
+                self.assertIsInstance(key, str)
+                self.assertTrue(key)
+        self.assertIsInstance(core._provider_slug("\udcff"), str)
+
+    def test_hostile_env_value_still_persists(self):
+        # Fail-soft must not mean "silently stop recording".
+        with self._env("https://" + "\udcff" + ".example/v1"):
+            line = self._run(PAYLOAD)
+        self.assertIn("wk 10%", line)
