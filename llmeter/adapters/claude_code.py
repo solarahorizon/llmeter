@@ -23,8 +23,9 @@ https://code.claude.com/docs/en/statusline: "Your status line command
 receives this JSON structure via stdin" — the schema table lists
 ``transcript_path`` as "Path to conversation transcript file") points at the
 session's own JSONL log. This adapter reads it ONLY to sum the two
-cache-creation-lifetime fields on each assistant message (see
-``_cache_ttl_totals``) — nothing else in the transcript is read or kept. A
+cache-creation-lifetime fields on each assistant message and track which one
+the most recent write used (see ``_cache_ttl_totals``) — nothing else in the
+transcript is read or kept. A
 small per-transcript resume file under ``core.DIR`` (see ``_ttl_cache_path``)
 lets each render scan only the lines appended since the last one, rather than
 re-parsing the whole transcript on every message.
@@ -151,10 +152,10 @@ def _ttl_cache_path(transcript_path):
 
 
 def _load_ttl_cache(cache_path):
-    """(offset, cache_5m, cache_1h, last_id) from the prior render, or None
-    if the file is missing, unreadable, or not exactly that shape. Malformed
-    input reads as "no cache" — a hostile or corrupt resume file must trigger
-    a fresh full scan, never a wrong number."""
+    """(offset, cache_5m, cache_1h, last_id, active) from the prior render, or
+    None if the file is missing, unreadable, or not exactly that shape.
+    Malformed input reads as "no cache" — a hostile or corrupt resume file
+    must trigger a fresh full scan, never a wrong number."""
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -166,6 +167,7 @@ def _load_ttl_cache(cache_path):
     cache_5m = data.get("cache_5m")
     cache_1h = data.get("cache_1h")
     last_id = data.get("last_id")
+    active = data.get("active")
     if not (isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0):
         return None
     for total in (cache_5m, cache_1h):
@@ -174,16 +176,23 @@ def _load_ttl_cache(cache_path):
             return None
     if last_id is not None and not isinstance(last_id, str):
         return None
-    return offset, cache_5m, cache_1h, last_id
+    if active not in (None, "5m", "1h"):
+        return None
+    # A non-zero total with no active lifetime is a resume file written before
+    # `active` existed; it must rescan, or the slot stays hidden until the
+    # next cache write.
+    if active is None and (cache_5m > 0 or cache_1h > 0):
+        return None
+    return offset, cache_5m, cache_1h, last_id, active
 
 
-def _save_ttl_cache(cache_path, offset, cache_5m, cache_1h, last_id):
+def _save_ttl_cache(cache_path, offset, cache_5m, cache_1h, last_id, active):
     """Best-effort atomic write of the resume file. Any failure here is
     swallowed rather than raised: a broken/unwritable cache directory must
     only cost the NEXT render a full re-scan, never this one. Writes exactly
-    the four fields ``_load_ttl_cache`` reads — no transcript content, no
-    message text, nothing beyond the two running totals, the resume offset
-    and the last message id."""
+    the five fields ``_load_ttl_cache`` reads — no transcript content, no
+    message text, nothing beyond the two running totals, the resume offset,
+    the last message id, and which lifetime is currently active."""
     try:
         cache_dir = os.path.dirname(cache_path)
         os.makedirs(cache_dir, exist_ok=True)
@@ -191,7 +200,8 @@ def _save_ttl_cache(cache_path, offset, cache_5m, cache_1h, last_id):
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump({"offset": offset, "cache_5m": cache_5m,
-                          "cache_1h": cache_1h, "last_id": last_id}, f)
+                          "cache_1h": cache_1h, "last_id": last_id,
+                          "active": active}, f)
             os.replace(tmp, cache_path)
         except OSError:
             try:
@@ -202,7 +212,7 @@ def _save_ttl_cache(cache_path, offset, cache_5m, cache_1h, last_id):
         pass
 
 
-def _scan_transcript(f, last_id):
+def _scan_transcript(f, last_id, active):
     """Parse complete ``type: "assistant"`` lines from the binary file object
     ``f``, starting at its current position, accumulating cache-creation
     totals. Deduped against ``last_id`` — the caller's running last-seen
@@ -211,10 +221,18 @@ def _scan_transcript(f, last_id):
     re-sending the same cumulative usage), and that is the only repeat this
     needs to catch across a resume boundary.
 
+    ``active`` — which lifetime ("5m" | "1h" | None) the most recent
+    ``cache_creation`` block wrote to — is threaded through the same way: it
+    carries the caller's prior value in, and is updated only by a line that
+    actually resolves to a bucket; a line with no usable ``cache_creation``,
+    or one whose ephemeral totals are both zero, leaves it unchanged. When a
+    block writes to both buckets, "5m" wins — a tie the real payload does not
+    appear to produce, but a deterministic pick beats an arbitrary one.
+
     A final line with no trailing ``\\n`` is left UNCONSUMED — the returned
     offset stops before it — so a write still in progress is picked up whole
     on the next scan rather than parsed half-written. Returns
-    (end_offset, cache_5m_delta, cache_1h_delta, last_id).
+    (end_offset, cache_5m_delta, cache_1h_delta, last_id, active).
     """
     cache_5m = 0
     cache_1h = 0
@@ -254,25 +272,30 @@ def _scan_transcript(f, last_id):
         # int(cache_5m)/int(cache_1h) raises OverflowError/ValueError on
         # those — outside this module's own except clauses — so a
         # non-finite value must be rejected here, before it is summed.
-        if (isinstance(m5, (int, float)) and not isinstance(m5, bool)
-                and math.isfinite(m5)):
+        m5_ok = isinstance(m5, (int, float)) and not isinstance(m5, bool) and math.isfinite(m5)
+        h1_ok = isinstance(h1, (int, float)) and not isinstance(h1, bool) and math.isfinite(h1)
+        if m5_ok:
             cache_5m += m5
-        if (isinstance(h1, (int, float)) and not isinstance(h1, bool)
-                and math.isfinite(h1)):
+        if h1_ok:
             cache_1h += h1
-    return offset, cache_5m, cache_1h, last_id
+        if m5_ok and m5 > 0:
+            active = "5m"
+        elif h1_ok and h1 > 0:
+            active = "1h"
+    return offset, cache_5m, cache_1h, last_id, active
 
 
 def _cache_ttl_totals(transcript_path):
     """Sum ``cache_creation`` ephemeral-lifetime tokens over the session
-    transcript. Resumes from a per-transcript on-disk cache (see
-    ``_ttl_cache_path``) so a render only scans the bytes appended since the
-    last one, not the whole transcript again — a status line fires on every
-    message, so re-parsing a long-running session's full transcript each time
-    would grow unboundedly with session length.
+    transcript, and track which lifetime is currently active. Resumes from a
+    per-transcript on-disk cache (see ``_ttl_cache_path``) so a render only
+    scans the bytes appended since the last one, not the whole transcript
+    again — a status line fires on every message, so re-parsing a
+    long-running session's full transcript each time would grow unboundedly
+    with session length.
 
     A missing/unreadable/non-string path, or a transcript ``os.path.getsize``
-    cannot read, reads as (0, 0), never raises — a NUL byte in the path
+    cannot read, reads as (0, 0, None), never raises — a NUL byte in the path
     raises ``ValueError`` from ``getsize``/``open`` themselves, not
     ``OSError``, hence the paired except below. A cached offset larger than
     the transcript's current size (the file shrank, or a new session reused
@@ -280,33 +303,35 @@ def _cache_ttl_totals(transcript_path):
     missing or corrupt cache. Any failure reading or writing the cache file
     itself falls back to a full scan for THIS render and never raises — see
     ``_load_ttl_cache`` / ``_save_ttl_cache``. Returns (cache_5m_tokens,
-    cache_1h_tokens), both plain ints.
+    cache_1h_tokens, active), the totals plain ints and ``active`` one of
+    "5m" / "1h" / None (no cache write seen yet in this session).
     """
     if not isinstance(transcript_path, str) or not transcript_path:
-        return (0, 0)
+        return (0, 0, None)
     try:
         size = os.path.getsize(transcript_path)
     except (OSError, ValueError):
-        return (0, 0)
+        return (0, 0, None)
 
     cache_path = _ttl_cache_path(transcript_path)
     cached = _load_ttl_cache(cache_path)
     if cached is not None and cached[0] <= size:
-        start_offset, base_5m, base_1h, last_id = cached
+        start_offset, base_5m, base_1h, last_id, active = cached
     else:
-        start_offset, base_5m, base_1h, last_id = 0, 0, 0, None
+        start_offset, base_5m, base_1h, last_id, active = 0, 0, 0, None, None
 
     try:
         with open(transcript_path, "rb") as f:
             f.seek(start_offset)
-            end_offset, delta_5m, delta_1h, last_id = _scan_transcript(f, last_id)
+            end_offset, delta_5m, delta_1h, last_id, active = _scan_transcript(
+                f, last_id, active)
     except (OSError, ValueError):
-        return (0, 0)
+        return (0, 0, None)
 
     cache_5m = base_5m + delta_5m
     cache_1h = base_1h + delta_1h
-    _save_ttl_cache(cache_path, end_offset, cache_5m, cache_1h, last_id)
-    return (int(cache_5m), int(cache_1h))
+    _save_ttl_cache(cache_path, end_offset, cache_5m, cache_1h, last_id, active)
+    return (int(cache_5m), int(cache_1h), active)
 
 
 def parse(data):
@@ -334,8 +359,9 @@ def parse(data):
         "cost": _session_spend(data),
         "session_id": data.get("session_id"),
     }
-    cache_5m, cache_1h = _cache_ttl_totals(data.get("transcript_path"))
-    reading["cache_ttl"] = {"cache_5m_tokens": cache_5m, "cache_1h_tokens": cache_1h}
+    cache_5m, cache_1h, cache_active = _cache_ttl_totals(data.get("transcript_path"))
+    reading["cache_ttl"] = {"cache_5m_tokens": cache_5m, "cache_1h_tokens": cache_1h,
+                            "active": cache_active}
     # Custom-model context-window correction. Claude Code only knows the
     # window of models in its own table; for everything else (e.g. a custom
     # qwen routed through a proxy) it reports 200k. Substitute the real window

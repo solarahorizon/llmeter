@@ -189,8 +189,8 @@ class AdapterTests(unittest.TestCase):
 
 class CacheTtlTests(unittest.TestCase):
     """cache_ttl: the session's cumulative cache_creation tokens, split by
-    ephemeral lifetime, summed straight from the transcript (see
-    claude_code._cache_ttl_totals)."""
+    ephemeral lifetime and summed straight from the transcript, plus which
+    lifetime the most recent write used (see claude_code._cache_ttl_totals)."""
 
     def setUp(self):
         d = tempfile.mkdtemp(prefix="llmeter-transcript-")
@@ -237,7 +237,8 @@ class CacheTtlTests(unittest.TestCase):
         ])
         r = self._parse({"transcript_path": self.transcript})
         self.assertEqual(r["cache_ttl"],
-                         {"cache_5m_tokens": 3000, "cache_1h_tokens": 5000})
+                         {"cache_5m_tokens": 3000, "cache_1h_tokens": 5000,
+                          "active": "5m"})
 
     def test_missing_cache_creation_field_counts_as_zero(self):
         # Older transcript lines predate the cache_creation field.
@@ -245,7 +246,7 @@ class CacheTtlTests(unittest.TestCase):
             "id": "msg_1", "usage": {"input_tokens": 10, "output_tokens": 5}}})])
         r = self._parse({"transcript_path": self.transcript})
         self.assertEqual(r["cache_ttl"],
-                         {"cache_5m_tokens": 0, "cache_1h_tokens": 0})
+                         {"cache_5m_tokens": 0, "cache_1h_tokens": 0, "active": None})
 
     def test_non_assistant_and_malformed_lines_are_skipped(self):
         self._write([
@@ -261,14 +262,15 @@ class CacheTtlTests(unittest.TestCase):
                    None, "", 5, {}):
             r = self._parse({"transcript_path": bad})
             self.assertEqual(r["cache_ttl"],
-                             {"cache_5m_tokens": 0, "cache_1h_tokens": 0}, bad)
+                             {"cache_5m_tokens": 0, "cache_1h_tokens": 0,
+                              "active": None}, bad)
 
     def test_embedded_nul_byte_path_never_raises(self):
         # A path string with an embedded NUL byte raises ValueError from
         # open() itself, not OSError.
         r = self._parse({"transcript_path": "abc\x00def"})
         self.assertEqual(r["cache_ttl"],
-                         {"cache_5m_tokens": 0, "cache_1h_tokens": 0})
+                         {"cache_5m_tokens": 0, "cache_1h_tokens": 0, "active": None})
 
     def test_non_finite_cache_values_are_rejected_not_summed(self):
         # json.loads accepts the non-standard Infinity/-Infinity/NaN
@@ -286,24 +288,24 @@ class CacheTtlTests(unittest.TestCase):
         ])
         r = self._parse({"transcript_path": self.transcript})
         self.assertEqual(r["cache_ttl"],
-                         {"cache_5m_tokens": 42, "cache_1h_tokens": 0})
+                         {"cache_5m_tokens": 42, "cache_1h_tokens": 0, "active": "5m"})
 
-    def test_render_shows_only_nonzero_buckets(self):
+    def test_render_shows_only_the_active_bucket_5m(self):
         line = core.format_line({"cache_ttl": {"cache_5m_tokens": 220_000,
-                                               "cache_1h_tokens": 0}})
+                                               "cache_1h_tokens": 0,
+                                               "active": "5m"}})
         self.assertEqual(line, "cache 5m:220k")
-        line = core.format_line({"cache_ttl": {"cache_5m_tokens": 0,
-                                               "cache_1h_tokens": 180_000}})
+
+    def test_render_shows_only_the_active_bucket_1h(self):
+        line = core.format_line({"cache_ttl": {"cache_5m_tokens": 220_000,
+                                               "cache_1h_tokens": 180_000,
+                                               "active": "1h"}})
         self.assertEqual(line, "cache 1h:180k")
 
-    def test_render_shows_both_buckets_joined(self):
-        line = core.format_line({"cache_ttl": {"cache_5m_tokens": 220_000,
-                                               "cache_1h_tokens": 12_000}})
-        self.assertEqual(line, "cache 5m:220k · 1h:12k")
-
-    def test_render_hides_slot_when_both_zero_or_unreadable(self):
+    def test_render_hides_slot_when_no_lifetime_seen_yet(self):
         self.assertEqual(core.format_line(
-            {"cache_ttl": {"cache_5m_tokens": 0, "cache_1h_tokens": 0}}), "llmeter")
+            {"cache_ttl": {"cache_5m_tokens": 0, "cache_1h_tokens": 0,
+                           "active": None}}), "llmeter")
         self.assertEqual(core.format_line({"cache_ttl": None}), "llmeter")
         self.assertEqual(core.format_line({}), "llmeter")
 
@@ -311,8 +313,30 @@ class CacheTtlTests(unittest.TestCase):
         self.assertEqual(core.format_line(
             {"cache_ttl": "junk"}), "llmeter")
         self.assertEqual(core.format_line(
-            {"cache_ttl": {"cache_5m_tokens": "not-a-number",
+            {"cache_ttl": {"active": "junk", "cache_5m_tokens": 100,
+                           "cache_1h_tokens": 0}}), "llmeter")
+        self.assertEqual(core.format_line(
+            {"cache_ttl": {"active": "5m", "cache_5m_tokens": "not-a-number",
                            "cache_1h_tokens": True}}), "llmeter")
+
+    def test_legacy_four_key_cache_file_rescans_instead_of_hiding_the_slot(self):
+        # A resume file written before `active` existed: offset at EOF and a
+        # non-zero total but no active key. Loading it as valid would leave
+        # active None -- and the slot hidden -- until the next cache write.
+        self._write([self._assistant_line("msg_1", ephemeral_1h=13_482_419)])
+        self._parse({"transcript_path": self.transcript})
+        with mock.patch.object(core, "DIR", self.cache_dir):
+            cache_path = claude_code._ttl_cache_path(self.transcript)
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        del data["active"]
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"], {"cache_5m_tokens": 0,
+                                          "cache_1h_tokens": 13_482_419,
+                                          "active": "1h"})
+        self.assertEqual(core.format_line(r), "cache 1h:13.5M")
 
     def test_end_to_end_parse_then_render(self):
         self._write([self._assistant_line("msg_1", ephemeral_5m=220_000),
@@ -320,7 +344,11 @@ class CacheTtlTests(unittest.TestCase):
         r = self._parse({"model": {"display_name": "Fable 5"},
                          "transcript_path": self.transcript})
         line = core.format_line(r)
-        self.assertIn("cache 5m:220k · 1h:12k", line)
+        # msg_2 (the most recent write) used 1h, so only that bucket shows,
+        # at its own cumulative total -- 5m never appears even though the
+        # session also wrote 220k of it earlier.
+        self.assertIn("cache 1h:12k", line)
+        self.assertNotIn("5m", line)
 
     def test_truncated_utf8_mid_write_never_raises(self):
         # Claude Code may still be appending the transcript when the status
@@ -340,13 +368,13 @@ class CacheTtlTests(unittest.TestCase):
         self._write([self._assistant_line("msg_1", ephemeral_5m=100)])
         r1 = self._parse({"transcript_path": self.transcript})
         self.assertEqual(r1["cache_ttl"],
-                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0})
+                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0, "active": "5m"})
         with open(self.transcript, "a") as f:
             f.write(self._assistant_line("msg_2", ephemeral_5m=200) + "\n")
             f.write(self._assistant_line("msg_3", ephemeral_1h=300) + "\n")
         r2 = self._parse({"transcript_path": self.transcript})
         self.assertEqual(r2["cache_ttl"],
-                         {"cache_5m_tokens": 300, "cache_1h_tokens": 300})
+                         {"cache_5m_tokens": 300, "cache_1h_tokens": 300, "active": "1h"})
         # A full parse of the same final file (fresh cache dir, no resume
         # state) must total the same as the resumed parse above.
         fresh_dir = tempfile.mkdtemp(prefix="llmeter-ttlcache-fresh-")
@@ -363,12 +391,12 @@ class CacheTtlTests(unittest.TestCase):
             f.write(partial)  # no trailing newline: write still in progress
         r1 = self._parse({"transcript_path": self.transcript})
         self.assertEqual(r1["cache_ttl"],
-                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0})
+                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0, "active": "5m"})
         with open(self.transcript, "a") as f:
             f.write("\n")  # the line completes
         r2 = self._parse({"transcript_path": self.transcript})
         self.assertEqual(r2["cache_ttl"],
-                         {"cache_5m_tokens": 300, "cache_1h_tokens": 0})
+                         {"cache_5m_tokens": 300, "cache_1h_tokens": 0, "active": "5m"})
 
     def test_duplicate_id_across_a_resume_boundary_counts_once(self):
         self._write([self._assistant_line("msg_1", ephemeral_5m=100)])
@@ -403,7 +431,53 @@ class CacheTtlTests(unittest.TestCase):
         with mock.patch.object(core, "DIR", blocked):
             r = claude_code.parse({"transcript_path": self.transcript})
         self.assertEqual(r["cache_ttl"],
-                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0})
+                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0, "active": "5m"})
+
+    def test_active_lifetime_is_5m_when_the_last_write_used_it(self):
+        self._write([self._assistant_line("msg_1", ephemeral_1h=492_000),
+                     self._assistant_line("msg_2", ephemeral_5m=731_000)])
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"]["active"], "5m")
+        self.assertEqual(core.format_line(r), "cache 5m:731k")
+
+    def test_active_lifetime_is_1h_when_the_last_write_used_it(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=731_000),
+                     self._assistant_line("msg_2", ephemeral_1h=492_000)])
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"]["active"], "1h")
+        self.assertEqual(core.format_line(r), "cache 1h:492k")
+
+    def test_active_lifetime_keeps_the_previous_value_when_the_last_write_used_neither(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=100)])
+        r1 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r1["cache_ttl"]["active"], "5m")
+        # msg_2 has a cache_creation block, but both ephemeral totals are 0 --
+        # it wrote to neither bucket, so the active lifetime must not change.
+        with open(self.transcript, "a") as f:
+            f.write(self._assistant_line("msg_2") + "\n")
+        r2 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r2["cache_ttl"], {"cache_5m_tokens": 100,
+                                           "cache_1h_tokens": 0, "active": "5m"})
+
+    def test_cache_file_has_exactly_five_keys(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=100)])
+        self._parse({"transcript_path": self.transcript})
+        with mock.patch.object(core, "DIR", self.cache_dir):
+            cache_path = claude_code._ttl_cache_path(self.transcript)
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(set(data.keys()),
+                         {"offset", "cache_5m", "cache_1h", "last_id", "active"})
+
+    def test_no_lifetime_seen_yet_hides_the_slot(self):
+        # No cache_creation block anywhere in the transcript: active stays
+        # None and the slot never appears, even though both totals are
+        # legitimately 0 (not a hostile/unreadable-transcript 0).
+        self._write([json.dumps({"type": "assistant", "message": {
+            "id": "msg_1", "usage": {"input_tokens": 10, "output_tokens": 5}}})])
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertIsNone(r["cache_ttl"]["active"])
+        self.assertEqual(core.format_line(r), "llmeter")
 
 
 class HarvestTests(unittest.TestCase):
