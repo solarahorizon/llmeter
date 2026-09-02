@@ -11,6 +11,7 @@ __pycache__/
 .codex-review.log
 .codex*
 .deepseek*
+docs/dev-review/
 
 # llmeter runtime output (never belongs in the repo)
 usage-snapshot.json
@@ -20,3 +21,6 @@ usage-history.jsonl
 
 # git worktrees live in the project, never committed
 worktrees/
+
+# local build/test logs (never committed)
+build_logs/

@@ -187,6 +187,225 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("account_id", r["caps"]["seven_day"])
 
 
+class CacheTtlTests(unittest.TestCase):
+    """cache_ttl: the session's cumulative cache_creation tokens, split by
+    ephemeral lifetime, summed straight from the transcript (see
+    claude_code._cache_ttl_totals)."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="llmeter-transcript-")
+        self.addCleanup(shutil.rmtree, d)
+        self.transcript = os.path.join(d, "session.jsonl")
+        self.cache_dir = tempfile.mkdtemp(prefix="llmeter-ttlcache-")
+        self.addCleanup(shutil.rmtree, self.cache_dir)
+
+    def _parse(self, data):
+        # Every real parse() call in this class routes through here so the
+        # resume-cache file it writes never lands in the developer's actual
+        # LLMETER_DIR (~/.claude/llmeter/ or a real override).
+        with mock.patch.object(core, "DIR", self.cache_dir):
+            return claude_code.parse(data)
+
+    def _assistant_line(self, msg_id, ephemeral_5m=0, ephemeral_1h=0):
+        return json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": msg_id,
+                "usage": {
+                    "input_tokens": 85,
+                    "cache_creation_input_tokens": ephemeral_5m + ephemeral_1h,
+                    "cache_read_input_tokens": 100981,
+                    "output_tokens": 421,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": ephemeral_1h,
+                        "ephemeral_5m_input_tokens": ephemeral_5m,
+                    },
+                },
+            },
+        })
+
+    def _write(self, lines):
+        with open(self.transcript, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_sums_split_by_lifetime_and_dedupes_by_message_id(self):
+        dup = self._assistant_line("msg_2", ephemeral_5m=3000)
+        self._write([
+            self._assistant_line("msg_1", ephemeral_1h=5000),  # 1h-only
+            dup,                                               # 5m-only
+            dup,                                               # repeated id: multi-block reply
+        ])
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"],
+                         {"cache_5m_tokens": 3000, "cache_1h_tokens": 5000})
+
+    def test_missing_cache_creation_field_counts_as_zero(self):
+        # Older transcript lines predate the cache_creation field.
+        self._write([json.dumps({"type": "assistant", "message": {
+            "id": "msg_1", "usage": {"input_tokens": 10, "output_tokens": 5}}})])
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"],
+                         {"cache_5m_tokens": 0, "cache_1h_tokens": 0})
+
+    def test_non_assistant_and_malformed_lines_are_skipped(self):
+        self._write([
+            "not json at all",
+            json.dumps({"type": "user", "message": {"id": "u1"}}),
+            self._assistant_line("msg_1", ephemeral_5m=100),
+        ])
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"]["cache_5m_tokens"], 100)
+
+    def test_unreadable_or_missing_path_is_zero_and_never_raises(self):
+        for bad in (os.path.join(os.path.dirname(self.transcript), "nope.jsonl"),
+                   None, "", 5, {}):
+            r = self._parse({"transcript_path": bad})
+            self.assertEqual(r["cache_ttl"],
+                             {"cache_5m_tokens": 0, "cache_1h_tokens": 0}, bad)
+
+    def test_embedded_nul_byte_path_never_raises(self):
+        # A path string with an embedded NUL byte raises ValueError from
+        # open() itself, not OSError.
+        r = self._parse({"transcript_path": "abc\x00def"})
+        self.assertEqual(r["cache_ttl"],
+                         {"cache_5m_tokens": 0, "cache_1h_tokens": 0})
+
+    def test_non_finite_cache_values_are_rejected_not_summed(self):
+        # json.loads accepts the non-standard Infinity/-Infinity/NaN
+        # literals, and int(inf)/int(nan) raise OverflowError/ValueError
+        # outside this module's own except clauses -- so a non-finite value
+        # must be rejected before it is summed, not merely type-checked.
+        self._write([
+            '{"type": "assistant", "message": {"id": "msg_1", "usage": '
+            '{"cache_creation": {"ephemeral_5m_input_tokens": Infinity, '
+            '"ephemeral_1h_input_tokens": 0}}}}',
+            '{"type": "assistant", "message": {"id": "msg_2", "usage": '
+            '{"cache_creation": {"ephemeral_5m_input_tokens": NaN, '
+            '"ephemeral_1h_input_tokens": -Infinity}}}}',
+            self._assistant_line("msg_3", ephemeral_5m=42),
+        ])
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"],
+                         {"cache_5m_tokens": 42, "cache_1h_tokens": 0})
+
+    def test_render_shows_only_nonzero_buckets(self):
+        line = core.format_line({"cache_ttl": {"cache_5m_tokens": 220_000,
+                                               "cache_1h_tokens": 0}})
+        self.assertEqual(line, "cache 5m:220k")
+        line = core.format_line({"cache_ttl": {"cache_5m_tokens": 0,
+                                               "cache_1h_tokens": 180_000}})
+        self.assertEqual(line, "cache 1h:180k")
+
+    def test_render_shows_both_buckets_joined(self):
+        line = core.format_line({"cache_ttl": {"cache_5m_tokens": 220_000,
+                                               "cache_1h_tokens": 12_000}})
+        self.assertEqual(line, "cache 5m:220k · 1h:12k")
+
+    def test_render_hides_slot_when_both_zero_or_unreadable(self):
+        self.assertEqual(core.format_line(
+            {"cache_ttl": {"cache_5m_tokens": 0, "cache_1h_tokens": 0}}), "llmeter")
+        self.assertEqual(core.format_line({"cache_ttl": None}), "llmeter")
+        self.assertEqual(core.format_line({}), "llmeter")
+
+    def test_render_hostile_shapes_never_raise(self):
+        self.assertEqual(core.format_line(
+            {"cache_ttl": "junk"}), "llmeter")
+        self.assertEqual(core.format_line(
+            {"cache_ttl": {"cache_5m_tokens": "not-a-number",
+                           "cache_1h_tokens": True}}), "llmeter")
+
+    def test_end_to_end_parse_then_render(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=220_000),
+                     self._assistant_line("msg_2", ephemeral_1h=12_000)])
+        r = self._parse({"model": {"display_name": "Fable 5"},
+                         "transcript_path": self.transcript})
+        line = core.format_line(r)
+        self.assertIn("cache 5m:220k · 1h:12k", line)
+
+    def test_truncated_utf8_mid_write_never_raises(self):
+        # Claude Code may still be appending the transcript when the status
+        # line reads it: a multi-byte UTF-8 character split across that
+        # write boundary must not raise UnicodeDecodeError out of the line
+        # iterator.
+        good = self._assistant_line("msg_1", ephemeral_5m=500).encode("utf-8")
+        with open(self.transcript, "wb") as f:
+            f.write(good + b"\n")
+            f.write(b'{"type": "assistant", "message": {"id": "msg_2", '
+                    b'"usage": {"cache_creation": {"ephemeral_1h_input_tokens": 7')
+            f.write("café".encode("utf-8")[:-1])  # truncated multi-byte char, no trailing newline
+        r = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"]["cache_5m_tokens"], 500)
+
+    def test_resume_parses_only_the_appended_tail(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=100)])
+        r1 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r1["cache_ttl"],
+                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0})
+        with open(self.transcript, "a") as f:
+            f.write(self._assistant_line("msg_2", ephemeral_5m=200) + "\n")
+            f.write(self._assistant_line("msg_3", ephemeral_1h=300) + "\n")
+        r2 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r2["cache_ttl"],
+                         {"cache_5m_tokens": 300, "cache_1h_tokens": 300})
+        # A full parse of the same final file (fresh cache dir, no resume
+        # state) must total the same as the resumed parse above.
+        fresh_dir = tempfile.mkdtemp(prefix="llmeter-ttlcache-fresh-")
+        self.addCleanup(shutil.rmtree, fresh_dir)
+        with mock.patch.object(core, "DIR", fresh_dir):
+            r_full = claude_code.parse({"transcript_path": self.transcript})
+        self.assertEqual(r2["cache_ttl"], r_full["cache_ttl"])
+
+    def test_trailing_partial_line_is_deferred_until_complete(self):
+        complete = self._assistant_line("msg_1", ephemeral_5m=100)
+        partial = self._assistant_line("msg_2", ephemeral_5m=200)
+        with open(self.transcript, "w") as f:
+            f.write(complete + "\n")
+            f.write(partial)  # no trailing newline: write still in progress
+        r1 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r1["cache_ttl"],
+                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0})
+        with open(self.transcript, "a") as f:
+            f.write("\n")  # the line completes
+        r2 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r2["cache_ttl"],
+                         {"cache_5m_tokens": 300, "cache_1h_tokens": 0})
+
+    def test_duplicate_id_across_a_resume_boundary_counts_once(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=100)])
+        r1 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r1["cache_ttl"]["cache_5m_tokens"], 100)
+        # The same id reappears after the resume point (a resent multi-block
+        # reply straddling where the last render left off).
+        with open(self.transcript, "a") as f:
+            f.write(self._assistant_line("msg_1", ephemeral_5m=100) + "\n")
+        r2 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r2["cache_ttl"]["cache_5m_tokens"], 100)
+
+    def test_shrunk_file_triggers_a_full_rescan(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=100),
+                     self._assistant_line("msg_2", ephemeral_5m=200)])
+        r1 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r1["cache_ttl"]["cache_5m_tokens"], 300)
+        # File shrinks/replaced (e.g. a new session reusing the path): the
+        # cached offset now exceeds the file's size and must be discarded.
+        self._write([self._assistant_line("msg_3", ephemeral_5m=42)])
+        r2 = self._parse({"transcript_path": self.transcript})
+        self.assertEqual(r2["cache_ttl"]["cache_5m_tokens"], 42)
+
+    def test_unreadable_cache_dir_falls_back_to_full_scan(self):
+        self._write([self._assistant_line("msg_1", ephemeral_5m=100)])
+        # A regular file occupying the cache directory's own path blocks any
+        # read or write under it (NotADirectoryError, an OSError), without
+        # relying on platform-specific permission bits.
+        blocked = os.path.join(self.cache_dir, "blocked")
+        with open(blocked, "w") as f:
+            f.write("not a directory")
+        with mock.patch.object(core, "DIR", blocked):
+            r = claude_code.parse({"transcript_path": self.transcript})
+        self.assertEqual(r["cache_ttl"],
+                         {"cache_5m_tokens": 100, "cache_1h_tokens": 0})
+
+
 class HarvestTests(unittest.TestCase):
     def setUp(self):
         d = tempfile.mkdtemp(prefix="llmeter-")

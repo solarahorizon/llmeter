@@ -10,15 +10,31 @@ maps that payload to a normalized Reading.
 Payload shape (Anthropic's, and theirs to change — read defensively)::
 
     { "session_id": "…",
+      "transcript_path": "/path/to/transcript.jsonl",
       "model": {"id": "…", "display_name": "…"},
       "context_window": {"used_percentage": 30,
                          "total_input_tokens": 295000,
                          "context_window_size": 1000000},
       "rate_limits": {"five_hour": {"used_percentage", "resets_at"},
                       "seven_day": {"used_percentage", "resets_at"}} }
+
+``transcript_path`` (documented at
+https://code.claude.com/docs/en/statusline: "Your status line command
+receives this JSON structure via stdin" — the schema table lists
+``transcript_path`` as "Path to conversation transcript file") points at the
+session's own JSONL log. This adapter reads it ONLY to sum the two
+cache-creation-lifetime fields on each assistant message (see
+``_cache_ttl_totals``) — nothing else in the transcript is read or kept. A
+small per-transcript resume file under ``core.DIR`` (see ``_ttl_cache_path``)
+lets each render scan only the lines appended since the last one, rather than
+re-parsing the whole transcript on every message.
 """
 
+import hashlib
+import json
+import math
 import os
+import tempfile
 
 from .. import core
 
@@ -123,6 +139,176 @@ def _session_spend(data):
     return {"session_usd": spend}
 
 
+def _ttl_cache_path(transcript_path):
+    """Resume-file path for one transcript's cache-TTL totals, under the same
+    directory as ``usage-snapshot.json`` (``core.DIR`` — overridable via
+    ``LLMETER_DIR``). Named by a hash of the transcript path, not the path
+    itself, so the filename never leaks the session id or project directory
+    name it usually embeds."""
+    digest = hashlib.sha256(
+        transcript_path.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    return os.path.join(core.DIR, "cache-ttl-{}.json".format(digest))
+
+
+def _load_ttl_cache(cache_path):
+    """(offset, cache_5m, cache_1h, last_id) from the prior render, or None
+    if the file is missing, unreadable, or not exactly that shape. Malformed
+    input reads as "no cache" — a hostile or corrupt resume file must trigger
+    a fresh full scan, never a wrong number."""
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    offset = data.get("offset")
+    cache_5m = data.get("cache_5m")
+    cache_1h = data.get("cache_1h")
+    last_id = data.get("last_id")
+    if not (isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0):
+        return None
+    for total in (cache_5m, cache_1h):
+        if not (isinstance(total, (int, float)) and not isinstance(total, bool)
+                and math.isfinite(total)):
+            return None
+    if last_id is not None and not isinstance(last_id, str):
+        return None
+    return offset, cache_5m, cache_1h, last_id
+
+
+def _save_ttl_cache(cache_path, offset, cache_5m, cache_1h, last_id):
+    """Best-effort atomic write of the resume file. Any failure here is
+    swallowed rather than raised: a broken/unwritable cache directory must
+    only cost the NEXT render a full re-scan, never this one. Writes exactly
+    the four fields ``_load_ttl_cache`` reads — no transcript content, no
+    message text, nothing beyond the two running totals, the resume offset
+    and the last message id."""
+    try:
+        cache_dir = os.path.dirname(cache_path)
+        os.makedirs(cache_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=cache_dir, prefix=".cache-ttl.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"offset": offset, "cache_5m": cache_5m,
+                          "cache_1h": cache_1h, "last_id": last_id}, f)
+            os.replace(tmp, cache_path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _scan_transcript(f, last_id):
+    """Parse complete ``type: "assistant"`` lines from the binary file object
+    ``f``, starting at its current position, accumulating cache-creation
+    totals. Deduped against ``last_id`` — the caller's running last-seen
+    message id, not a full historical set, because on a real transcript a
+    repeated id is the very next assistant line (a multi-block reply
+    re-sending the same cumulative usage), and that is the only repeat this
+    needs to catch across a resume boundary.
+
+    A final line with no trailing ``\\n`` is left UNCONSUMED — the returned
+    offset stops before it — so a write still in progress is picked up whole
+    on the next scan rather than parsed half-written. Returns
+    (end_offset, cache_5m_delta, cache_1h_delta, last_id).
+    """
+    cache_5m = 0
+    cache_1h = 0
+    offset = f.tell()
+    while True:
+        raw = f.readline()
+        if not raw or not raw.endswith(b"\n"):
+            break
+        offset = f.tell()
+        text = raw.decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        message = obj.get("message")
+        if not isinstance(message, dict):
+            continue
+        msg_id = message.get("id")
+        if msg_id is not None:
+            if msg_id == last_id:
+                continue
+            last_id = msg_id
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        cc = usage.get("cache_creation")
+        if not isinstance(cc, dict):
+            continue
+        m5 = cc.get("ephemeral_5m_input_tokens")
+        h1 = cc.get("ephemeral_1h_input_tokens")
+        # math.isfinite, not just isinstance: json.loads accepts the
+        # non-standard literals Infinity/-Infinity/NaN, and the final
+        # int(cache_5m)/int(cache_1h) raises OverflowError/ValueError on
+        # those — outside this module's own except clauses — so a
+        # non-finite value must be rejected here, before it is summed.
+        if (isinstance(m5, (int, float)) and not isinstance(m5, bool)
+                and math.isfinite(m5)):
+            cache_5m += m5
+        if (isinstance(h1, (int, float)) and not isinstance(h1, bool)
+                and math.isfinite(h1)):
+            cache_1h += h1
+    return offset, cache_5m, cache_1h, last_id
+
+
+def _cache_ttl_totals(transcript_path):
+    """Sum ``cache_creation`` ephemeral-lifetime tokens over the session
+    transcript. Resumes from a per-transcript on-disk cache (see
+    ``_ttl_cache_path``) so a render only scans the bytes appended since the
+    last one, not the whole transcript again — a status line fires on every
+    message, so re-parsing a long-running session's full transcript each time
+    would grow unboundedly with session length.
+
+    A missing/unreadable/non-string path, or a transcript ``os.path.getsize``
+    cannot read, reads as (0, 0), never raises — a NUL byte in the path
+    raises ``ValueError`` from ``getsize``/``open`` themselves, not
+    ``OSError``, hence the paired except below. A cached offset larger than
+    the transcript's current size (the file shrank, or a new session reused
+    the path) discards the cache and rescans from the start, same as a
+    missing or corrupt cache. Any failure reading or writing the cache file
+    itself falls back to a full scan for THIS render and never raises — see
+    ``_load_ttl_cache`` / ``_save_ttl_cache``. Returns (cache_5m_tokens,
+    cache_1h_tokens), both plain ints.
+    """
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return (0, 0)
+    try:
+        size = os.path.getsize(transcript_path)
+    except (OSError, ValueError):
+        return (0, 0)
+
+    cache_path = _ttl_cache_path(transcript_path)
+    cached = _load_ttl_cache(cache_path)
+    if cached is not None and cached[0] <= size:
+        start_offset, base_5m, base_1h, last_id = cached
+    else:
+        start_offset, base_5m, base_1h, last_id = 0, 0, 0, None
+
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(start_offset)
+            end_offset, delta_5m, delta_1h, last_id = _scan_transcript(f, last_id)
+    except (OSError, ValueError):
+        return (0, 0)
+
+    cache_5m = base_5m + delta_5m
+    cache_1h = base_1h + delta_1h
+    _save_ttl_cache(cache_path, end_offset, cache_5m, cache_1h, last_id)
+    return (int(cache_5m), int(cache_1h))
+
+
 def parse(data):
     """Claude Code statusLine payload -> normalized Reading (see core).
 
@@ -148,6 +334,8 @@ def parse(data):
         "cost": _session_spend(data),
         "session_id": data.get("session_id"),
     }
+    cache_5m, cache_1h = _cache_ttl_totals(data.get("transcript_path"))
+    reading["cache_ttl"] = {"cache_5m_tokens": cache_5m, "cache_1h_tokens": cache_1h}
     # Custom-model context-window correction. Claude Code only knows the
     # window of models in its own table; for everything else (e.g. a custom
     # qwen routed through a proxy) it reports 200k. Substitute the real window

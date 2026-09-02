@@ -17,6 +17,10 @@ Normalized Reading (what every adapter returns) — a plain dict::
         },
         "cost": {"session_usd": 0.42, "tokens": 12000},  # pay-per-token, or None
         "session_id": "…",                 # opaque, for cross-window dedup
+        "cache_ttl": {                     # session-cumulative, summed fresh
+            "cache_5m_tokens": 220000,      # from the transcript every render
+            "cache_1h_tokens": 12000,       # (not carried by the snapshot)
+        },
     }
 
 Cap-metered tools (Claude Code, Codex, Antigravity) fill ``caps``.
@@ -463,7 +467,7 @@ def fmt_tokens(n):
 
 def format_line(reading, snap=None):
     """The visible status line: model · ctx N% (tokens/window) · 5h N% (reset)
-    · wk N% (reset) [· $cost].
+    [· cache 5m:Nk · 1h:Nk] · wk N% (reset) [· $cost].
 
     ``reading`` is this message's live reading (model + context + maybe caps).
     ``snap`` is the freshest persisted snapshot — used only to fill the
@@ -497,6 +501,25 @@ def format_line(reading, snap=None):
         ctx_part = "{} ({})".format(ctx_part, detail) if ctx_part else "ctx " + detail
     if ctx_part:
         parts.append(ctx_part)
+
+    # Cache-creation lifetime split (5-minute vs 1-hour TTL buckets), summed
+    # fresh from the transcript on every render — not merged with the
+    # cross-window snapshot, since the transcript already holds the whole
+    # session's history. Hidden entirely when both buckets are 0 (no cache
+    # writes yet, or the adapter couldn't read the transcript).
+    cache_ttl = reading.get("cache_ttl")
+    if isinstance(cache_ttl, dict):
+        c5 = cache_ttl.get("cache_5m_tokens")
+        c1 = cache_ttl.get("cache_1h_tokens")
+        c5 = c5 if isinstance(c5, (int, float)) and not isinstance(c5, bool) and c5 > 0 else 0
+        c1 = c1 if isinstance(c1, (int, float)) and not isinstance(c1, bool) and c1 > 0 else 0
+        bits = []
+        if c5:
+            bits.append("5m:{}".format(fmt_tokens(c5)))
+        if c1:
+            bits.append("1h:{}".format(fmt_tokens(c1)))
+        if bits:
+            parts.append("cache " + " · ".join(bits))
 
     # Prefer this message's own caps; else the cross-window persisted snapshot.
     # Coerce every step to a dict — the host owns this schema and may hand us

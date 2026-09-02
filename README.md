@@ -1,9 +1,9 @@
 # llmeter
 
-An ambient **usage meter for AI coding CLIs**. It shows — right under your prompt — which model you're on, how full your context window is, and **how much of your session and weekly limits you've burned**:
+An ambient **usage meter for AI coding CLIs**. It shows — right under your prompt — which model you're on, how full your context window is, how many prompt-cache tokens the session has written (split by 5-minute vs 1-hour TTL), and **how much of your session and weekly limits you've burned**:
 
 ```
-Opus 4.8 (1M) · ctx 30% (295k/1M) · 5h 22% (resets 14:30) · wk 37% (resets Tue 10:00)
+Opus 4.8 (1M context) · ctx 30% (295k/1M) · cache 5m:220k · 5h 22% (resets 14:30) · wk 37% (resets Tue 10:00)
 ```
 
 `5h` is the rolling 5-hour session window (the one you hit mid-afternoon) and `wk` the weekly plan. The 5-hour reset shows the clock time alone when it lands today, and keeps its weekday when it doesn't — a window opened in the evening resets after midnight, so a bare `01:00` would read as a time that has already gone.
@@ -43,6 +43,7 @@ cat ~/.claude/llmeter/usage-snapshot.json
 You should see a recent snapshot with `caps` populated.
 
 - The `5h N%` and `wk N%` fields appear only **after the first API response of a session**, and only for **Pro/Max** accounts (that's when Claude Code includes the rate-limit data). A brand-new window shows the account-level caps from the freshest capture any window made.
+- The `cache 5m:Nk` / `1h:Nk` field is the session's cumulative `cache_creation_input_tokens`, split by ephemeral TTL bucket and summed straight from the session's own transcript — not a cap, just what this session has written into the prompt cache so far. It shows only the non-zero bucket(s), and disappears entirely once both are zero (or the transcript can't be read).
 
 ## How it works
 
@@ -58,7 +59,7 @@ every message  ·  + every 60s
                                                           usage-history.jsonl   (one line per change)
 ```
 
-- **Private & local.** Everything happens inside the Claude Code process on your machine. No network, no credentials, no telemetry. The two files under `~/.claude/llmeter/` never leave your disk.
+- **Private & local.** Everything happens inside the Claude Code process on your machine. No network, no credentials, no telemetry. The files under `~/.claude/llmeter/` never leave your disk. For the `cache` field, llmeter reads the session's own transcript file (`transcript_path` in the stdin payload) locally, and keeps one small resume file per transcript (`~/.claude/llmeter/cache-ttl-<hash>.json`) holding only the running 5m/1h totals, a byte offset into the transcript, and the last message id seen — so each render sums just the lines appended since the last one, not the whole transcript again. Nothing else from the transcript is read, kept, or written to disk.
 - **Fail-soft.** If Claude Code ever changes the payload shape, llmeter still prints a line and never breaks your prompt (locked by the test suite).
 - **Multi-window safe.** Run many Claude Code panes at once — the snapshot write is atomic and both caps are account-level, so they cooperate rather than collide.
 
