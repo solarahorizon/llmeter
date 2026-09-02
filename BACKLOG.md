@@ -5,6 +5,16 @@ Adapter work per CLI is tracked in `docs/ROADMAP.md`; this file holds defects an
 
 ## Defects
 
+- [ ] **An idle pane renders its own stale caps after another pane has landed a reset
+  (`render_prefers_stale_caps_after_reset`).** `format_line` prefers the reading's own `rate_limits`
+  over the snapshot's. After the weekly reset (88 → 8) a pane that has had no API response since
+  still reads `wk 88%` while the file and the returned snapshot hold 8, so two panes disagree and one
+  is stale. Found by the codex vendor leg on `fix/cap-reset-freshness` (2026-09-02); the behaviour is
+  on `main` and that branch does not touch the render path. Candidate fix: a republish that
+  `write_snapshot` filtered as a fingerprint match is positive evidence that this reading's caps are
+  a replay, so render from the returned snapshot's caps in that case only. Needs a test with two
+  sessions, one reset, one idle. · source: session 2026-09-02 · small
+
 - [x] **A cap reset inside a window is discarded, so the snapshot and history hold the old
   percentage until the window's reset time changes.** Seen 2026-09-02: Anthropic reset the weekly
   allowance in the morning (a launch promotion; `/usage` read 8% at 11:12 AEST, reset time unchanged
