@@ -69,7 +69,7 @@ Terminal-independent: works identically under Terminal.app, iTerm2, tmux, VS Cod
 
 | File | What |
 |---|---|
-| `~/.claude/llmeter/usage-snapshot.json` | Latest capture (atomic overwrite) — model, context %, cap windows. |
+| `~/.claude/llmeter/usage-snapshot.json` | Latest capture (atomic overwrite) — model, context %, cap windows, and a per-session freshness fingerprint (a hash + timestamp, pruned after 24h) used to tell a genuine cap change from a stale republish. |
 | `~/.claude/llmeter/usage-snapshot.<host>.json` | Same, for a session routed at a non-Anthropic endpoint. One file per provider. |
 | `~/.claude/llmeter/usage-history.jsonl` | Append-only log, one line whenever a cap % changes — chart your week. |
 | `~/.claude/llmeter/usage-history.<host>.jsonl` | Same, per non-Anthropic endpoint. Kept apart so a tool reading the default log never counts another account's rows. |

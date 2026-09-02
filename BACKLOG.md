@@ -5,7 +5,7 @@ Adapter work per CLI is tracked in `docs/ROADMAP.md`; this file holds defects an
 
 ## Defects
 
-- [ ] **A cap reset inside a window is discarded, so the snapshot and history hold the old
+- [x] **A cap reset inside a window is discarded, so the snapshot and history hold the old
   percentage until the window's reset time changes.** Seen 2026-09-02: Anthropic reset the weekly
   allowance in the morning (a launch promotion; `/usage` read 8% at 11:12 AEST, reset time unchanged
   at Sat 04:00), the status line showed the live 8%, but `usage-snapshot.json` and every
@@ -41,10 +41,18 @@ Adapter work per CLI is tracked in `docs/ROADMAP.md`; this file holds defects an
   4. History appends on any change, as now, so a reset logs as its own row.
 
   **What this does and does not guarantee.** The flap is bounded to one occurrence per idle session
-  per llmeter start: an idle session's first write has no stored fingerprint and is accepted once,
-  then every identical republish is ignored, including a stale high value after a reset, which the
-  max rule can never reject. A session whose payload changes but whose `rate_limits` are stale (Claude
+  for as long as that session keeps refreshing: its first write has no stored fingerprint and is
+  accepted once, then every identical republish is ignored, including a stale high value after a
+  reset, which the max rule can never reject. A republish renews the entry's timestamp, so the 24 h
+  prune forgets a session that has stopped refreshing, never a quiet one; a session silent for 24 h
+  and then back is accepted once more. A session whose payload changes but whose `rate_limits` are stale (Claude
   Code only refreshes them on an API response, so this should not happen) would still be accepted.
+  The fingerprint must cover every persisted field a session can change by itself, so it is derived
+  from `_SNAPSHOT_FIELDS` rather than listed by hand: a hand list missed `cost` (a pay-per-token
+  session's spend froze on disk), then `model`/`context_window_size` (a `/model` switch) and
+  `context_pct`, one per review round. And `captured_at` no longer advances on a republish, so a snapshot
+  every session has left idle for 6 h expires from `read_snapshot` until one of them gets an API
+  response: a 7-hour-old value is exactly what today's record shows to be untrustworthy.
 
   **Tests to add or change** in `tests/test_llmeter.py`, `MergeTests`: (a) same window, fresh lower
   reading is accepted and logged (the reset); (b) identical republish of a lower value from a second
@@ -55,3 +63,7 @@ Adapter work per CLI is tracked in `docs/ROADMAP.md`; this file holds defects an
 
   Sizing: `core.py` merge and write paths, about 30 lines net; one reading of `adapters/claude_code.py`
   to confirm `session_id` and `context_tokens` are always on the Reading (they are today).
+
+  Fixed 2026-09-02 on fix/cap-reset-freshness: fingerprint per session over every `_SNAPSHOT_FIELDS`
+  value, replace-on-fresh; tests (a)–(g) plus (h) a cost-only change is fresh and (i) every persisted
+  field moving alone is fresh.

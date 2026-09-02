@@ -815,8 +815,9 @@ if __name__ == "__main__":
 
 
 class MergeCapsTests(unittest.TestCase):
-    """Idle sessions re-publish stale caps with fresh captured_at; the
-    snapshot must keep the per-window truth (2026-07-06 flapping bug)."""
+    """A session's fingerprint decides whether its reading is fresh; only a
+    fresh reading's window replaces the stored one for the same window
+    (2026-07-06 flapping bug; 2026-09-02 cap-reset-inside-a-window bug)."""
 
     def setUp(self):
         d = tempfile.mkdtemp(prefix="llm-merge-")
@@ -824,27 +825,167 @@ class MergeCapsTests(unittest.TestCase):
         self.snap = os.path.join(d, "s.json")
         self.hist = os.path.join(d, "h.jsonl")
 
-    def _reading(self, pct, resets=1783468800):
-        return {"source": "claude-code", "model": "M",
-                "caps": {"seven_day": {"used_percentage": pct,
-                                       "resets_at": resets}}}
+    def _reading(self, pct, resets=1783468800, session_id=None, context_tokens=None):
+        r = {"source": "claude-code", "model": "M",
+             "caps": {"seven_day": {"used_percentage": pct,
+                                    "resets_at": resets}}}
+        if session_id is not None:
+            r["session_id"] = session_id
+        if context_tokens is not None:
+            r["context_tokens"] = context_tokens
+        return r
 
-    def _write(self, pct, resets=1783468800):
-        return core.write_snapshot(self._reading(pct, resets),
-                                   snapshot_path=self.snap,
-                                   history_path=self.hist)
+    def _write(self, pct, resets=1783468800, session_id=None, context_tokens=None,
+              now=None):
+        return core.write_snapshot(
+            self._reading(pct, resets, session_id, context_tokens),
+            snapshot_path=self.snap, history_path=self.hist, now=now)
 
-    def test_same_window_keeps_max(self):
+    def test_fresh_lower_reading_same_session_is_the_reset(self):
+        # (a) A session's own genuinely lower reading in the same window is a
+        # real reset, not a stale replay, and must win + log.
+        self._write(88, session_id="s-1")
+        snap = self._write(8, session_id="s-1")
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 8)
+        self.assertEqual(len(_lines(self.hist)), 2)
+
+    def test_identical_republish_from_a_second_session_is_ignored(self):
+        # (b) rewrite of the old test_same_window_keeps_max, which asserted
+        # the defect this WI fixes: a stale republish no longer blocks a
+        # genuinely fresh, lower reading from a different session.
+        self._write(82, session_id="s-a")
+        self._write(58, session_id="s-b")  # fresh from s-b: a real reset
+        snap = self._write(58, session_id="s-b")  # s-b repeats itself: ignored
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 58)
+        self.assertEqual(len(_lines(self.hist)), 2)  # the repeat logs nothing
+
+    def test_stale_republish_of_a_higher_value_after_reset_is_ignored(self):
+        # (c) The bug, reproduced directly: session A's identical replay of
+        # its pre-reset high value must not re-poison the post-reset low one.
+        self._write(88, session_id="s-a")
+        self._write(8, session_id="s-b")  # the reset, seen by a fresh session
+        snap = self._write(88, session_id="s-a")  # A's stale replay
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 8)
+        self.assertEqual(len(_lines(self.hist)), 2)  # the replay logs nothing
+
+    def test_no_session_id_is_always_fresh(self):
+        # (g) A reading with no usable session_id can't be deduped, so it is
+        # accepted on every write — the guarantee's stated limit.
         self._write(82)
-        snap = self._write(58)  # stale session republishing yesterday's view
-        self.assertEqual(
-            snap["caps"]["seven_day"]["used_percentage"], 82)
+        snap = self._write(58)
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 58)
+        snap = self._write(82)
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 82)
+
+    def test_sessions_prunes_entries_older_than_24h(self):
+        # (e) A stale session's fingerprint must not linger forever.
+        self._write(10, session_id="s-old", now="2026-09-01T00:00:00+00:00")
+        snap = self._write(20, session_id="s-new",
+                          now="2026-09-02T01:00:00+00:00")
+        self.assertNotIn("s-old", snap["sessions"])
+        self.assertIn("s-new", snap["sessions"])
+
+    def test_fingerprint_on_disk_is_a_hash_only(self):
+        # (f) Nothing from the raw payload reaches disk under "sessions" but
+        # a hash and a timestamp — context_tokens/caps are legitimately
+        # persisted elsewhere in the snapshot, just never inside "sessions".
+        snap = self._write(37, session_id="s-1", context_tokens=205600)
+        entry = snap["sessions"]["s-1"]
+        self.assertRegex(entry["fp"], r"^[0-9a-f]{64}$")
+        self.assertEqual(set(entry), {"fp", "at"})  # no cap-value field at all
+        on_disk_sessions = _json(self.snap)["sessions"]["s-1"]
+        self.assertEqual(set(on_disk_sessions), {"fp", "at"})
+        self.assertEqual(on_disk_sessions["fp"], entry["fp"])
+
+    def test_cost_only_change_is_fresh_and_persists(self):
+        # (h) A pay-per-token proxy session may report no context window at
+        # all, so context_tokens is None and caps are absent on every reading;
+        # only cost moves. That reading is fresh, not a republish, and its
+        # spend must reach disk.
+        def reading(usd):
+            return {"source": "claude-code", "model": "M", "session_id": "s-cost",
+                    "cost": {"session_usd": usd, "tokens": 1000}}
+        for usd in (0.10, 1.50, 7.25):
+            snap = core.write_snapshot(reading(usd), snapshot_path=self.snap,
+                                       history_path=self.hist)
+            self.assertEqual(snap["cost"]["session_usd"], usd)
+            self.assertEqual(_json(self.snap)["cost"]["session_usd"], usd)
+        snap = core.write_snapshot(reading(7.25), snapshot_path=self.snap,
+                                   history_path=self.hist)  # a true republish
+        self.assertEqual(snap["cost"]["session_usd"], 7.25)
+
+    def test_every_persisted_field_moving_alone_is_fresh(self):
+        # (i) The fingerprint is derived from _SNAPSHOT_FIELDS, so a change in
+        # ANY persisted field with everything else held still is fresh and
+        # reaches disk: a /model switch (model + window, same tokens), a
+        # percentage-only reading, a cost-only reading. Hand-listing the
+        # fields missed each of these once.
+        base = {"source": "claude-code", "model": "Opus 5", "session_id": "s-1",
+                "context_tokens": 115035, "context_window_size": 200000,
+                "context_pct": 57, "cost": {"session_usd": 0.1, "tokens": 10},
+                "caps": {"seven_day": {"used_percentage": 10,
+                                       "resets_at": 1783468800}}}
+        core.write_snapshot(dict(base), snapshot_path=self.snap, history_path=self.hist)
+        for field, value in (("model", "Kimi K3"), ("context_window_size", 1048576),
+                             ("context_pct", 11), ("cost", {"session_usd": 0.2, "tokens": 20})):
+            moved = dict(base)
+            moved[field] = value
+            snap = core.write_snapshot(moved, snapshot_path=self.snap,
+                                       history_path=self.hist)
+            self.assertEqual(snap[field], value, field)
+            self.assertEqual(_json(self.snap)[field], value, field)
+        for name in core._FINGERPRINT_FIELDS:
+            self.assertIn(name, core._SNAPSHOT_FIELDS)
+        self.assertNotIn("session_id", core._FINGERPRINT_FIELDS)
+        self.assertNotIn("sessions", core._FINGERPRINT_FIELDS)
+
+    def test_a_quiet_pane_that_keeps_refreshing_is_never_forgotten(self):
+        # (j) The prune measures liveness: a republish renews the entry's
+        # timestamp. A pane idle for days but still refreshing keeps its
+        # fingerprint, so its stale replay after another pane's reset is still
+        # filtered; a pane silent for 24 h is forgotten.
+        self._write(88, session_id="idle", now="2026-09-01T00:00:00+00:00")
+        self._write(88, session_id="dead", now="2026-09-01T00:00:00+00:00")
+        snap = self._write(88, session_id="idle", now="2026-09-01T23:00:00+00:00")
+        self.assertEqual(snap["sessions"]["idle"]["at"], "2026-09-01T23:00:00+00:00")
+        snap = self._write(8, session_id="active", now="2026-09-02T01:00:00+00:00")
+        self.assertIn("idle", snap["sessions"])
+        self.assertNotIn("dead", snap["sessions"])
+        snap = self._write(88, session_id="idle", now="2026-09-02T01:01:00+00:00")
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 8)
+        self.assertEqual(len(_lines(self.hist)), 2)  # 88 then 8; the replay logs nothing
+        snap = self._write(88, session_id="dead", now="2026-09-02T01:02:00+00:00")
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 88)  # forgotten: accepted once
+
+    def test_a_republish_racing_a_reset_renews_its_entry_without_reverting_the_reset(self):
+        # (k) The idle pane read the snapshot before the active pane wrote the
+        # reset. Its republish must write the file as it is NOW, plus its own
+        # renewed entry -- never the pre-reset copy it read first.
+        self._write(88, session_id="idle", now="2026-09-02T00:00:00+00:00")
+        pre_reset = _json(self.snap)
+        self._write(8, session_id="active", now="2026-09-02T01:00:00+00:00")
+        real_read = core.read_snapshot
+        calls = []
+
+        def stale_first(path=None, max_age_secs=6 * 3600, provider=None):
+            calls.append(path)
+            if len(calls) == 1:
+                return dict(pre_reset)
+            return real_read(path, max_age_secs=max_age_secs, provider=provider)
+
+        with mock.patch.object(core, "read_snapshot", side_effect=stale_first):
+            snap = self._write(88, session_id="idle", now="2026-09-02T01:00:30+00:00")
+        self.assertEqual(len(calls), 2)  # the first read, then the re-read before writing
+        self.assertEqual(snap["caps"]["seven_day"]["used_percentage"], 8)
+        self.assertEqual(_json(self.snap)["caps"]["seven_day"]["used_percentage"], 8)
+        self.assertEqual(_json(self.snap)["sessions"]["idle"]["at"], "2026-09-02T01:00:30+00:00")
+        self.assertEqual(len(_lines(self.hist)), 2)
 
     def test_stale_republish_appends_no_history(self):
-        self._write(82)
-        self._write(58)
-        self._write(76)
-        self.assertEqual(len(_lines(self.hist)), 1)  # only the first value logged
+        self._write(82, session_id="s-1")
+        self._write(82, session_id="s-1")  # byte-identical: filtered upstream
+        self._write(82, session_id="s-1")
+        self.assertEqual(len(_lines(self.hist)), 1)  # only the first write logged
 
     def test_new_window_wins_even_if_lower(self):
         self._write(82, resets=1783468800)
@@ -901,15 +1042,18 @@ class MergeCapsTests(unittest.TestCase):
         self.assertEqual(self._merged(old, new), 4)
         self.assertEqual(self._merged(new, old), 4)  # order must not matter
 
-    def test_iso_same_window_keeps_max(self):
+    def test_iso_same_window_new_reading_wins(self):
         stamp = _iso(1782050340)
         self.assertEqual(self._merged(self._win(88, stamp),
-                                      self._win(41, stamp)), 88)
+                                      self._win(41, stamp)), 41)
 
     def test_epoch_and_equivalent_iso_are_one_window(self):
+        # Same instant, two wire forms: recognized as ONE window (the new
+        # reading wins), not two windows that would fall to the differing-
+        # resets_at branch instead.
         stamp = 1782050340
         self.assertEqual(self._merged(self._win(88, stamp),
-                                      self._win(41, _iso(stamp))), 88)
+                                      self._win(41, _iso(stamp))), 41)
         self.assertEqual(self._merged(self._win(41, _iso(stamp)),
                                       self._win(88, stamp)), 88)
 

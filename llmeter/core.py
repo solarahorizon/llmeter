@@ -16,7 +16,7 @@ Normalized Reading (what every adapter returns) — a plain dict::
             "five_hour": {"used_percentage": 1,  "resets_at": <epoch|iso>},
         },
         "cost": {"session_usd": 0.42, "tokens": 12000},  # pay-per-token, or None
-        "session_id": "…",                 # opaque, for cross-window dedup
+        "session_id": "…",                 # opaque; keys the republish fingerprint
         "cache_ttl": {                     # session-cumulative, summed fresh
             "cache_5m_tokens": 220000,      # from the transcript every render
             "cache_1h_tokens": 12000,       # (not carried by the snapshot)
@@ -215,8 +215,12 @@ def _has_usable_data(reading):
 # The ONLY Reading fields that ever reach disk (CONTRIBUTING ground rule 3):
 # every persisted field is explicitly allowlisted, so an adapter (or a future
 # Reading extension) can never silently widen what lands in ~/.claude/llmeter/.
+# ``sessions`` is on this list too even though core computes it rather than
+# copying it from the Reading (see write_snapshot) — it holds a hash and a
+# timestamp per session, never the raw context_tokens/caps it was hashed from.
 _SNAPSHOT_FIELDS = ("source", "model", "context_pct", "context_tokens",
-                    "context_window_size", "caps", "cost", "session_id")
+                    "context_window_size", "caps", "cost", "session_id",
+                    "sessions")
 
 # Written by core itself rather than copied from a Reading, so the allowlist
 # above still holds: no adapter can widen what is persisted. Listed explicitly
@@ -225,6 +229,64 @@ _SNAPSHOT_FIELDS = ("source", "model", "context_pct", "context_tokens",
 # ANTHROPIC_BASE_URL. If that endpoint is an internal gateway, redact it before
 # pasting a snapshot into a bug report — see CONTRIBUTING.
 _STAMPED_FIELDS = ("captured_at", "provider")
+
+# What a session's republish fingerprint hashes: every persisted Reading field
+# except the key of the map itself and the map core writes.
+_FINGERPRINT_FIELDS = tuple(k for k in _SNAPSHOT_FIELDS
+                            if k not in ("session_id", "sessions"))
+
+
+def _session_id(reading):
+    """The reading's session id, if it's a nonempty string, else None. A
+    missing/non-string/empty id can't key a fingerprint, so ``write_snapshot``
+    treats that reading as fresh on every call rather than deduping it."""
+    sid = reading.get("session_id") if isinstance(reading, dict) else None
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _session_fingerprint(reading):
+    """sha256 hex of every ``_SNAPSHOT_FIELDS`` value the reading carries, or
+    None if they can't be serialized. Derived from the allowlist, not listed by
+    hand, so it covers every persisted field a session can change on its own
+    by construction — ``cost`` alone on a pay-per-token proxy, ``model`` and
+    ``context_window_size`` on a model switch, ``context_pct`` alone. An idle
+    session republishes these byte-identical on every statusline refresh; a
+    session that just received an API response changes at least one. That
+    difference separates a stale replay from a genuine change, a cap reset
+    included — a value-based rule cannot, since a reset also arrives as a
+    lower number in the same window."""
+    reading = reading if isinstance(reading, dict) else {}
+    try:
+        payload = json.dumps({k: reading.get(k) for k in _FINGERPRINT_FIELDS},
+                             sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(_utf8(payload)).hexdigest()
+
+
+def _prune_sessions(sessions, now_dt):
+    """Keep only entries whose ``at`` parses as a timestamp within 24h of
+    ``now_dt``, so a long-running install's session map does not grow
+    forever. An entry with an unparseable ``at`` or a non-string ``fp`` is
+    dropped, not kept — a hostile or legacy shape must not survive."""
+    sessions = sessions if isinstance(sessions, dict) else {}
+    kept = {}
+    for sid, entry in sessions.items():
+        if not isinstance(sid, str) or not isinstance(entry, dict):
+            continue
+        fp, at = entry.get("fp"), entry.get("at")
+        if not isinstance(fp, str) or not fp or not isinstance(at, str):
+            continue
+        try:
+            at_dt = datetime.datetime.fromisoformat(at)
+        except ValueError:
+            continue
+        if at_dt.tzinfo is None:
+            at_dt = at_dt.astimezone()
+        if (now_dt - at_dt).total_seconds() > 24 * 3600:
+            continue
+        kept[sid] = {"fp": fp, "at": at}
+    return kept
 
 
 def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
@@ -236,6 +298,12 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
       so we persist only when ``caps`` or ``cost`` is present.
     - Only ``_SNAPSHOT_FIELDS`` are written — a field not on that allowlist
       never reaches disk, whatever an adapter puts in the Reading.
+    - A reading whose fingerprint (see ``_session_fingerprint``) matches the
+      stored fingerprint for its ``session_id`` is a republish of an unchanged
+      payload: the merge and the history append are both skipped, and the
+      previously stored snapshot is returned untouched. A reading with no
+      usable session id (missing, non-string, empty) gets no fingerprint and
+      is always treated as fresh.
     - Write is atomic (tmp + os.replace) so a concurrent reader never sees a
       torn file — multiple CLI panes may write these same files at once.
     - History appends one line only when a cap percentage actually changes
@@ -249,18 +317,43 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     history_path = history_path or history_path_for(provider)
     if not _has_usable_data(reading):
         return None
+
+    # provider-checked: never merge another account's percentages into this
+    # one, even if both somehow resolved to the same file.
+    prev = read_snapshot(snapshot_path, max_age_secs=None, provider=provider)
+    prev_sessions = (prev or {}).get("sessions")
+    prev_sessions = prev_sessions if isinstance(prev_sessions, dict) else {}
+
+    sid = _session_id(reading)
+    fp = _session_fingerprint(reading) if sid is not None else None
+    captured_at = now or now_iso()
+    now_dt = _as_datetime(captured_at)
+    if fp is not None and isinstance(prev_sessions.get(sid), dict) \
+            and prev_sessions[sid].get("fp") == fp:
+        # A republish renews only this session's entry, so the prune measures
+        # liveness rather than time since the payload last changed. It re-reads
+        # the file first and writes THAT copy: `prev` may predate another pane's
+        # reset, and writing it back would revert the reset.
+        latest = read_snapshot(snapshot_path, max_age_secs=None, provider=provider) or prev
+        latest = dict(latest)
+        latest.pop("age_secs", None)
+        sessions = latest.get("sessions")
+        sessions = dict(sessions) if isinstance(sessions, dict) else {}
+        sessions[sid] = {"fp": fp, "at": captured_at}
+        latest["sessions"] = _prune_sessions(sessions, now_dt)
+        os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+        _write_atomic(snapshot_path, latest)
+        return latest
+
     snap = {k: reading[k] for k in _SNAPSHOT_FIELDS if k in reading}
-    snap["captured_at"] = now or now_iso()
+    snap["captured_at"] = captured_at
     # Stamped by core, not copied from the Reading: the provider is a property
     # of the environment the session runs in, not of anything an adapter parsed.
     snap["provider"] = provider
     os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
 
-    # provider-checked: never merge another account's percentages into this
-    # one, even if both somehow resolved to the same file.
-    prev = read_snapshot(snapshot_path, max_age_secs=None, provider=provider)
     # Unconditional: {} is safer than leaving a hostile non-dict "caps" from
-    # the raw reading in the snapshot (deepseek review).
+    # the raw reading in the snapshot.
     snap["caps"] = _merge_caps((prev or {}).get("caps"), snap.get("caps"))
     # History logs the MERGED truth: a stale session re-publishing old numbers
     # merges to no-change and appends nothing (no more flapping in the log).
@@ -273,10 +366,31 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
         except OSError:
             pass
 
-    # A UNIQUE temp file per writer (not a shared "<name>.tmp") so concurrent
-    # panes never clobber each other's in-flight write; os.replace is atomic, so
-    # a reader always sees a whole old-or-new file. (codex P2: a fixed temp path
-    # let two writers race and could promote malformed JSON.)
+    # This reading's fingerprint is the one future republishes from the same
+    # session will be compared against; other sessions' entries carry over
+    # untouched except for the 24h prune.
+    if fp is not None:
+        prev_sessions = dict(prev_sessions)
+        prev_sessions[sid] = {"fp": fp, "at": captured_at}
+    snap["sessions"] = _prune_sessions(prev_sessions, now_dt)
+    _write_atomic(snapshot_path, snap)
+    return snap
+
+
+def _as_datetime(iso):
+    """An aware datetime for an ISO timestamp; now() when it does not parse."""
+    try:
+        parsed = datetime.datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return datetime.datetime.now().astimezone()
+    return parsed if parsed.tzinfo is not None else parsed.astimezone()
+
+
+def _write_atomic(snapshot_path, snap):
+    """Write ``snap`` as JSON to ``snapshot_path`` through a unique temp file
+    and ``os.replace``, so concurrent panes never clobber each other's
+    in-flight write and a reader always sees a whole old-or-new file. Raises
+    OSError after removing its temp file."""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(snapshot_path),
                                prefix=".usage-snapshot.", suffix=".tmp")
     try:
@@ -289,7 +403,6 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
         except OSError:
             pass
         raise
-    return snap
 
 
 def _cap_pct(win):
@@ -307,20 +420,21 @@ def _cap_pct(win):
 
 
 def _merge_caps(prev_caps, new_caps):
-    """Merge cap windows so the snapshot is the account-level truth, not the
-    last writer's view. Idle CLI sessions re-publish their LAST-KNOWN caps on
-    every statusline refresh, so a session that has not called the API for
-    hours keeps stamping yesterday's percentage with a fresh captured_at —
-    last-writer-wins made the meter flap (69->82->69 within a minute, seen
-    live 2026-07-06). Per window: a later resets_at is a newer window and wins
-    outright; the SAME resets_at means the same window, where the account
-    percentage is monotonically non-decreasing -> keep the max.
+    """Merge cap windows into the account-level truth. ``write_snapshot``
+    already filters out a session's byte-identical republish by fingerprint
+    before calling this, so every ``new_caps`` window that reaches here is a
+    reading that actually changed — freshness decides the winner, not size.
+    Per window: a later resets_at names a newer window and wins outright; an
+    earlier one loses; the SAME resets_at is the SAME window, where the new
+    reading always replaces the stored one (a cap reset included). When only
+    one side names a window at all, the named side wins — a legacy/hostile
+    entry with no resets_at must never block every future window forever.
+    Neither side naming a window is the one shape with no freshness signal at
+    all, so the higher percentage is kept there.
 
     Which window a reading belongs to is decided by the PARSED instant, not by
-    the wire type. Comparing types instead let two ISO resets_at values fall
-    through to max-wins (a meter frozen at its high-water mark) and, in the
-    mixed case, handed the win to whichever side happened to be numeric. A
-    weekly window hides both; a 5-hour window rolls five times a day."""
+    the wire type: an epoch int and an ISO string naming the same instant are
+    one window, not two."""
     prev_caps = prev_caps if isinstance(prev_caps, dict) else {}
     new_caps = new_caps if isinstance(new_caps, dict) else {}
     merged = {}
@@ -334,8 +448,8 @@ def _merge_caps(prev_caps, new_caps):
             continue
         old_r = _reset_epoch(old_w.get("resets_at"))
         new_r = _reset_epoch(new_w.get("resets_at"))
-        if old_r is not None and new_r is not None and old_r != new_r:
-            merged[w] = new_w if new_r > old_r else old_w
+        if old_r is not None and new_r is not None:
+            merged[w] = new_w if new_r >= old_r else old_w
         elif (old_r is None) != (new_r is None):
             # Only one side is window-identified: it wins — otherwise a
             # legacy/hostile entry with no resets_at but a higher % would
