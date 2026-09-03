@@ -171,6 +171,77 @@ export LLMETER_CONTEXT_WINDOWS="my-model=1048576,other-model=262144"
 
 Malformed entries are ignored rather than breaking the status line.
 
+## Which cache lifetime should you be on?
+
+Claude Code has two prompt-cache lifetimes, and on a Claude subscription it puts
+your main conversation on the **one-hour** one unless you say otherwise. Most
+people never chose that and cannot see it. `llmeter ttl` measures whether it is
+the right choice for you:
+
+```bash
+./llmeter-ttl.sh                      # the report, last 14 days
+./llmeter-ttl.sh --days 30
+./llmeter-ttl.sh --json
+./llmeter-ttl.sh --html               # the report, plus a page with the reasoning
+./llmeter-ttl.sh --html --quiet       # the page only
+```
+
+`--html` writes `llmeter-ttl.html` into the directory you run it from and prints
+where it went. Without `--html` nothing is written at all.
+
+```
+MAIN CONVERSATION  (promptCacheTtl)
+  SET TO           5m      [~/.claude/settings.json]
+  ACTUALLY GOT     70%     of writes on the 1h cache, 30% on 5m
+                   (most of this window predates that setting)
+  MEASURED         35,079  requests across 44 conversations
+  CACHE WRITES     127.6M  <- the 1h premium is charged on all of this
+  IDLE-GAP PREFIX  77.5M   <- 515 gaps of 5-60 min; only this earns it back
+                   74 of those gaps had to be estimated
+  1H PAYS EXTRA    95.7M   (input-token equivalents)
+  5M PAYS EXTRA    89.6M
+  --> USE 5m               cheaper by 6.0M
+      to flip: your idle-gap volume would have to be 1.07x what it is
+```
+
+**The point most people miss:** the premium and the payoff are charged on
+different quantities. You pay the one-hour premium on **every token you write**
+(2x the input rate, against 1.25x for five minutes). You earn it back only on
+the prefix you **would have re-written** after idling past five minutes. So the
+question is not "do I take breaks?" — it is whether your idle-gap volume is
+large next to your write volume. One hour wins only below roughly:
+
+```
+writes  <  1.5 x idle-gap prefix tokens
+```
+
+Read the margin, not just the verdict. The run above lands on 5m by 6.0M out of
+95.7M — a 1.07x flip factor, which is a coin toss, and a different week would land
+the other way. The same machine's subagent traffic is not close: 5m by 72M at a
+5.5x flip factor, because agent loops write constantly and rarely idle. A verdict
+with a flip factor near 1.0 is telling you the setting barely matters for you.
+
+Set it in `~/.claude/settings.json`:
+
+```json
+{
+  "promptCacheTtl": "5m",
+  "subagentPromptCacheTtl": "5m"
+}
+```
+
+Both keys need Claude Code v2.1.242 or later. `llmeter ttl` reads your local
+transcripts and makes no network call. It writes nothing unless `--html` asks
+for a page, and then only that page.
+
+**What it can't tell you.** On a subscription you spend quota, not dollars, and
+how the meter weights a one-hour write against a five-minute one is not
+derivable from a transcript. Treat the verdict as a direction with a stated
+margin, not a bill. Gaps longer than an hour miss under both lifetimes, so they
+are excluded rather than credited to either. A gap whose prefix had already been
+dropped — after a compaction or a model switch — is counted as though the hour
+would have held it, which flatters `1h` slightly.
+
 ## Uninstall
 
 ```bash

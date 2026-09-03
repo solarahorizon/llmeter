@@ -16,6 +16,7 @@ docs/dev-review/
 # llmeter runtime output (never belongs in the repo)
 usage-snapshot.json
 usage-history.jsonl
+llmeter-ttl.html
 *.llmeter-bak-*
 *.llmeter-tmp
 
