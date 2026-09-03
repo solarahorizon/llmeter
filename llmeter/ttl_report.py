@@ -469,7 +469,7 @@ def _ledger(name, stats):
       they were read; under 5m they would have been written again.</p>
       <div class="calc">
         <div class="line"><span>prefix rescued</span><b>%s</b></div>
-        <div class="line"><span>5m surcharge over 1h (1.25 less your %.2f read rate)</span><b>&times; %.2f</b></div>
+        <div class="line"><span>5m surcharge over 1h (1.25 less your %.3g read rate)</span><b>&times; %.2f</b></div>
         <div class="total"><span>5m pays extra</span><b>%s</b></div>
       </div>
     </div>

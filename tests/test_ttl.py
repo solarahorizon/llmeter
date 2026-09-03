@@ -782,7 +782,7 @@ class HtmlReportTest(TTLFixture):
         self.write_session("s1", [turn(1200, written=23_000, model="claude-fable-5-1"),
                                   turn(600, written=0, read=15_000, model="claude-fable-5-1")])
         page = self.page()
-        self.assertIn("less your 0.03 read rate", page)
+        self.assertIn("less your 0.025 read rate", page)
         self.assertIn("&times; 1.23", page)
 
     def test_a_near_tie_prints_a_flip_factor_that_is_not_one(self):
