@@ -15,6 +15,7 @@ terminal output can never disagree about a number.
 """
 
 import html
+import os
 
 from llmeter import ttl
 
@@ -538,9 +539,16 @@ def render_html(report, settings):
     for name in (ttl.BUCKET_MAIN, ttl.BUCKET_OTHER):
         body.append(_ledger(name, report["buckets"][name]))
     body.append(_CAVEATS)
+    # Name the directory actually read (CLAUDE_CONFIG_DIR or --projects-dir can
+    # move it) — the footer is the page's claim about its own provenance.
+    source = report.get("projects_dir") or ttl.DEFAULT_PROJECTS_DIR
+    home = os.path.expanduser("~")
+    if source.startswith(home + os.sep):
+        source = "~" + source[len(home):]
     body.append(
         "<footer>llmeter ttl &mdash; measured from local transcripts under "
-        "~/.claude/projects &middot; no network, nothing sent anywhere</footer>"
+        + html.escape(source)
+        + " &middot; no network, nothing sent anywhere</footer>"
     )
     body.append("</div>")
 

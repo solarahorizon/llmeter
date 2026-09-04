@@ -41,10 +41,11 @@ this module estimates D from the delta writes on that conversation's own cache
 hits, falling back to the bucket's median; where the transcript separates them,
 the recorded values are used and nothing is estimated.
 
-This module reads your own transcripts under ``~/.claude/projects`` to measure
-W and G per TTL bucket, and prints the verdict with the margin that would flip
-it. Offline: it opens local transcripts and makes no network call. It writes
-nothing unless ``--html`` asks for a page, and then only that page.
+This module reads your own transcripts under ``~/.claude/projects`` (or
+``$CLAUDE_CONFIG_DIR/projects``) to measure W and G per TTL bucket, and prints
+the verdict with the margin that would flip it. Offline: it opens local
+transcripts and makes no network call. It writes nothing unless ``--html`` asks
+for a page, and then only that page.
 
 Run it::
 
@@ -62,6 +63,8 @@ import json
 import os
 import statistics
 import sys
+
+from . import core
 
 # Cache-write prices as a multiple of the model's input-token price, per
 # https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pricing
@@ -87,8 +90,10 @@ SETTING_FOR_BUCKET = {
     BUCKET_OTHER: "subagentPromptCacheTtl",
 }
 
-DEFAULT_PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
-DEFAULT_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+# Both live under Claude Code's config dir, which CLAUDE_CONFIG_DIR can move —
+# see core.config_dir().
+DEFAULT_PROJECTS_DIR = os.path.join(core.config_dir(), "projects")
+DEFAULT_SETTINGS_PATH = os.path.join(core.config_dir(), "settings.json")
 
 
 def read_multiplier(model):
@@ -352,7 +357,8 @@ def measure(projects_dir=None, days=14, now=None):
     buckets = {}
     for name in (BUCKET_MAIN, BUCKET_OTHER):
         buckets[name] = _score(_new_bucket(name), grouped[name])
-    return {"window_days": days, "generated_at": now, "buckets": buckets}
+    return {"window_days": days, "generated_at": now, "buckets": buckets,
+            "projects_dir": projects_dir}
 
 
 def _score(stats, conversation_list):
@@ -654,7 +660,8 @@ def main(argv=None):
         description="Recommend promptCacheTtl / subagentPromptCacheTtl from your own transcripts.",
     )
     parser.add_argument("--days", type=int, default=14, help="window to measure (default 14)")
-    parser.add_argument("--projects-dir", default=None, help="override ~/.claude/projects")
+    parser.add_argument("--projects-dir", default=None, help="override the transcripts dir (default ~/.claude/projects, or "
+                             "$CLAUDE_CONFIG_DIR/projects)")
     parser.add_argument("--json", action="store_true", help="emit the measurement as JSON")
     parser.add_argument(
         "--html",

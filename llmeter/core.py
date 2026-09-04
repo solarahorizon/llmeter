@@ -40,10 +40,24 @@ import os
 import tempfile
 import urllib.parse
 
+# Claude Code's config dir moves with CLAUDE_CONFIG_DIR, so llmeter's files
+# must follow it — otherwise we'd write beside a settings.json the user never
+# reads. Resolved the way the host does: the env var wins only when it is set
+# to a non-empty value, and its value is used verbatim (the host does no tilde
+# expansion of its own, and a shell already expanded an unquoted `~`).
+CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+
+
+def config_dir():
+    """Claude Code's config dir: ``$CLAUDE_CONFIG_DIR`` if populated, else
+    ``~/.claude``."""
+    override = (os.environ.get(CONFIG_DIR_ENV) or "").strip()
+    return override or os.path.join(os.path.expanduser("~"), ".claude")
+
+
 # Output dir is overridable so a caller can point it at another location
 # (e.g. a menu-bar consumer's dir, or a temp dir in tests).
-DIR = os.environ.get("LLMETER_DIR") or os.path.join(
-    os.path.expanduser("~"), ".claude", "llmeter")
+DIR = os.environ.get("LLMETER_DIR") or os.path.join(config_dir(), "llmeter")
 SNAPSHOT_PATH = os.path.join(DIR, "usage-snapshot.json")
 HISTORY_PATH = os.path.join(DIR, "usage-history.jsonl")
 

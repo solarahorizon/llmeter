@@ -13,7 +13,15 @@ set -eu
 
 REPO="${0:A:h}"
 WRAPPER="$REPO/llmeter-statusline.sh"
-SETTINGS="${LLMETER_SETTINGS:-${HOME:?llmeter: set HOME or LLMETER_SETTINGS}/.claude/settings.json}"
+# Claude Code's config dir: CLAUDE_CONFIG_DIR when it is set to a non-empty
+# value, else ~/.claude. Resolved the way the host resolves it, so we read and
+# write the same settings.json Claude Code does.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  CONFIG_DIR="$CLAUDE_CONFIG_DIR"
+else
+  CONFIG_DIR="${HOME:?llmeter: set HOME, CLAUDE_CONFIG_DIR or LLMETER_SETTINGS}/.claude"
+fi
+SETTINGS="${LLMETER_SETTINGS:-$CONFIG_DIR/settings.json}"
 PURGE="no"
 [ "${1:-}" = "--purge" ] && PURGE="yes"
 
@@ -73,7 +81,7 @@ print(f"llmeter: removed statusLine from {settings} (backup: {backup})")
 PY
 
 if [ "$PURGE" = "yes" ]; then
-  DIR="${LLMETER_DIR:-$HOME/.claude/llmeter}"
+  DIR="${LLMETER_DIR:-$CONFIG_DIR/llmeter}"
   rm -rf "$DIR"
   echo "llmeter: purged data dir $DIR"
 fi
