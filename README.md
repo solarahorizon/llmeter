@@ -181,6 +181,7 @@ the right choice for you:
 ```bash
 ./llmeter-ttl.sh                      # the report, last 14 days
 ./llmeter-ttl.sh --days 30
+./llmeter-ttl.sh --sessions 5         # lead with your last 5 conversations, not 10
 ./llmeter-ttl.sh --json
 ./llmeter-ttl.sh --html               # the report, plus a page with the reasoning
 ./llmeter-ttl.sh --html --quiet       # the page only
@@ -190,6 +191,14 @@ the right choice for you:
 where it went. Without `--html` nothing is written at all.
 
 ```
+llmeter ttl — which prompt-cache lifetime is cheaper for your traffic
+
+YOUR LAST 10 CONVERSATIONS  (of 44 in the last 14 days)
+  MAIN CONVERSATION  set 5m    -> KEEP 5m      cheaper by 4.9M; flips at 1.09x (thin)
+  EVERYTHING ELSE    set 5m    -> KEEP 5m      cheaper by 63.4M; flips at 6.06x (clear)
+
+--- detail, last 14 days ---
+
 MAIN CONVERSATION  (promptCacheTtl)
   SET TO           5m      [~/.claude/settings.json]
   ACTUALLY GOT     70%     of writes on the 1h cache, 30% on 5m
@@ -203,6 +212,11 @@ MAIN CONVERSATION  (promptCacheTtl)
   --> USE 5m               cheaper by 6.0M
       to flip: your idle-gap volume would have to be 1.07x what it is
 ```
+
+The head measures only your most recent 10 conversations, with no day cutoff,
+so it answers "is the setting I have right now paying off on my recent
+traffic" — the detail below it still measures the full 14-day window, which
+usually includes traffic from before you last touched the setting.
 
 **The point most people miss:** the premium and the payoff are charged on
 different quantities. You pay the one-hour premium on **every token you write**
