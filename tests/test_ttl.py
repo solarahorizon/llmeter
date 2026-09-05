@@ -98,6 +98,9 @@ class TTLFixture(unittest.TestCase):
     def other(self, days=14):
         return self.measure(days)["buckets"][ttl.BUCKET_OTHER]
 
+    def recent(self, sessions=10):
+        return ttl.measure_recent(projects_dir=self.root, sessions=sessions, now=NOW)
+
 
 class DeduplicationTest(TTLFixture):
     def test_multi_block_reply_counts_once(self):
@@ -893,6 +896,158 @@ class HtmlReportTest(TTLFixture):
         self.assertIn("opposite", err)
         # A refused run does its work nowhere: no page either.
         self.assertFalse(os.path.exists(target))
+
+
+class AdviseTest(unittest.TestCase):
+    """advise() turns a bucket's verdict and setting into one action."""
+
+    def stats(self, verdict, delta=1_000.0, flip_factor=2.0):
+        return {"verdict": verdict, "delta": delta, "flip_factor": flip_factor}
+
+    def test_keep_when_the_setting_already_matches_the_verdict(self):
+        advice = ttl.advise(self.stats("5m"), "5m")
+        self.assertEqual(advice["action"], "KEEP")
+        self.assertEqual(advice["to"], "5m")
+
+    def test_change_when_the_setting_disagrees_with_the_verdict(self):
+        advice = ttl.advise(self.stats("1h"), "5m")
+        self.assertEqual(advice["action"], "CHANGE")
+        self.assertEqual(advice["to"], "1h")
+
+    def test_set_when_nothing_is_configured_yet(self):
+        advice = ttl.advise(self.stats("5m"), None)
+        self.assertEqual(advice["action"], "SET")
+        self.assertEqual(advice["to"], "5m")
+
+    def test_no_data_when_the_bucket_has_no_verdict(self):
+        advice = ttl.advise(self.stats(None, delta=0.0, flip_factor=None), "5m")
+        self.assertEqual(advice["action"], "NO DATA")
+        self.assertIsNone(advice["to"])
+        self.assertIsNone(advice["margin_tokens"])
+        self.assertIsNone(advice["flip_factor"])
+        self.assertIsNone(advice["confidence"])
+
+    def test_margin_tokens_is_the_deltas_absolute_size(self):
+        advice = ttl.advise(self.stats("5m", delta=-4_900_000.0), "5m")
+        self.assertEqual(advice["margin_tokens"], 4_900_000.0)
+
+    def test_flip_factor_just_below_the_threshold_is_thin(self):
+        advice = ttl.advise(self.stats("5m", flip_factor=1.24), "5m")
+        self.assertEqual(advice["confidence"], "thin")
+
+    def test_flip_factor_at_the_threshold_is_clear(self):
+        advice = ttl.advise(self.stats("5m", flip_factor=1.25), "5m")
+        self.assertEqual(advice["confidence"], "clear")
+
+    def test_no_flip_factor_reads_as_no_confidence(self):
+        advice = ttl.advise(self.stats("5m", flip_factor=None), "5m")
+        self.assertIsNone(advice["confidence"])
+
+
+class MeasureRecentTest(TTLFixture):
+    def test_picks_by_last_request_not_filename_or_first_request(self):
+        # A ran long: an old first turn, then one 40s ago, so its LAST request
+        # is the most recent of the three. X is a single turn a little later.
+        # Y is older than both. Filenames run opposite of recency (A sorts
+        # first, Y sorts last), so a filename sort gets this backwards, and A's
+        # very old first turn would sink it under a first-request sort.
+        self.write_session("aaa_a", [turn(90_000, written=500), turn(40, written=500)])
+        self.write_session("mmm_x", [turn(45, written=500)])
+        self.write_session("zzz_y", [turn(500, written=500)])
+        stats = self.recent(sessions=2)["buckets"][ttl.BUCKET_MAIN]
+        self.assertEqual(stats["requests"], 3)  # A's 2 + X's 1; Y's 1 is excluded
+
+    def test_subagent_traffic_follows_its_owning_session(self):
+        self.write_session("included", [turn(40, written=100)])
+        self.write_session("excluded", [turn(90_000, written=100)])
+        self.write_subagent("included", "agent-a", [turn(30, written=1_000)])
+        self.write_subagent("excluded", "agent-b", [turn(90_000, written=2_000)])
+        stats = self.recent(sessions=1)["buckets"][ttl.BUCKET_OTHER]
+        self.assertEqual(stats["requests"], 1)
+        self.assertEqual(stats["write_tokens"], 1_000)
+
+    def test_sidechain_turns_in_an_included_session_are_everything_else(self):
+        self.write_session("s1", [turn(40, written=100)])
+        self.write_session("s1", [turn(35, written=2_000)], sidechain=True)
+        stats = self.recent(sessions=1)["buckets"][ttl.BUCKET_OTHER]
+        self.assertEqual(stats["requests"], 1)
+        self.assertEqual(stats["write_tokens"], 2_000)
+
+    def test_reports_requested_and_found_session_counts(self):
+        self.write_session("s1", [turn(40, written=100)])
+        self.write_session("s2", [turn(90, written=100)])
+        result = self.recent(sessions=5)
+        self.assertEqual(result["sessions"], 5)
+        self.assertEqual(result["sessions_found"], 2)
+
+    def test_no_time_cutoff_a_very_old_session_can_still_be_picked(self):
+        # measure() would drop this at 14 days; measure_recent() has no cutoff
+        # at all — the session set itself is the window.
+        self.write_session("only", [turn(60 * 60 * 24 * 400, written=100)])
+        stats = self.recent(sessions=1)["buckets"][ttl.BUCKET_MAIN]
+        self.assertEqual(stats["requests"], 1)
+
+
+class RecentHeadRenderTest(TTLFixture):
+    def test_head_appears_before_the_detail(self):
+        self.write_session("s1", [turn(600, written=100_000), turn(540, written=100_000)])
+        text = ttl.render(self.measure(), settings={}, recent=self.recent())
+        self.assertLess(text.index("YOUR LAST"), text.index("--- detail"))
+
+    def test_change_wording_when_the_setting_disagrees(self):
+        # RED: the setting is 1h, but the measurement recommends 5m.
+        self.write_session("s1", [turn(600, written=100_000), turn(540, written=100_000)])
+        settings = {ttl.BUCKET_MAIN: ("1h", "settings.json"),
+                    ttl.BUCKET_OTHER: ("1h", "settings.json")}
+        text = ttl.render(self.measure(), settings=settings, recent=self.recent())
+        self.assertIn("CHANGE to 5m", text)
+
+    def test_keep_wording_and_no_disagreement_when_settings_already_agree(self):
+        # False alarm: the setting is already 5m, and so is the measurement.
+        self.write_session("s1", [turn(600, written=100_000), turn(540, written=100_000)])
+        settings = {ttl.BUCKET_MAIN: ("5m", "settings.json"),
+                    ttl.BUCKET_OTHER: ("5m", "settings.json")}
+        text = ttl.render(self.measure(), settings=settings, recent=self.recent())
+        self.assertIn("KEEP 5m", text)
+        self.assertNotIn("lands on", text)
+        self.assertNotIn("still landed on the", text)
+
+    def test_recent_absent_renders_exactly_as_before(self):
+        self.write_session("s1", [turn(600, written=100_000), turn(540, written=100_000)])
+        text = ttl.render(self.measure(), settings={})
+        self.assertNotIn("YOUR LAST", text)
+        self.assertNotIn("--- detail", text)
+
+
+class RecentHeadHtmlTest(TTLFixture):
+    def test_head_precedes_your_answer_and_carries_the_verdict(self):
+        self.write_session("s1", [turn(600, written=100_000), turn(540, written=100_000)])
+        settings = {ttl.BUCKET_MAIN: ("5m", "settings.json"),
+                    ttl.BUCKET_OTHER: ("5m", "settings.json")}
+        page = ttl_report.render_html(self.measure(), settings, self.recent())
+        self.assertLess(page.index("your last"), page.index("your answer"))
+        self.assertIn("keep 5m", page)
+
+    def test_recent_absent_omits_the_head_section(self):
+        self.write_session("s1", [turn(600, written=100_000), turn(540, written=100_000)])
+        page = ttl_report.render_html(self.measure(), {})
+        self.assertNotIn("your last", page)
+
+
+class RecentJsonTest(TTLFixture):
+    def run_cli_capturing(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stderr(err):
+                code = ttl.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_json_output_carries_recent_advice(self):
+        self.write_session("s1", [turn(600, written=100_000)])
+        code, out, _err = self.run_cli_capturing(["--projects-dir", self.root, "--json"])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertIn("action", payload["recent"]["buckets"][ttl.BUCKET_MAIN]["advice"])
 
 
 if __name__ == "__main__":

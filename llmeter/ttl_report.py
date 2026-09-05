@@ -9,8 +9,9 @@ The page is one file with no external reference: styles inline, no script, no
 image, no font URL. It has to open from a ``file://`` path on a machine with no
 network, and it has to survive being mailed to someone as an attachment.
 
-``render_html`` takes the same ``report`` mapping ``ttl.measure`` returns and the
-same ``settings`` mapping ``ttl.current_settings`` returns, so the page and the
+``render_html`` takes the same ``report`` mapping ``ttl.measure`` returns, the
+same ``settings`` mapping ``ttl.current_settings`` returns, and (optionally)
+the same ``recent`` mapping ``ttl.measure_recent`` returns, so the page and the
 terminal output can never disagree about a number.
 """
 
@@ -30,6 +31,12 @@ def _esc(value):
 
 def _millions(tokens):
     return "%.1fM" % (tokens / 1e6)
+
+
+# Verdict-word colour by advise() action: KEEP/SET read as the settled state,
+# CHANGE as the thing to act on, NO DATA as neither.
+_ADVICE_COLOUR = {"KEEP": "save", "SET": "save", "CHANGE": "cost", "NO DATA": "carry"}
+_ADVICE_WORD = {"KEEP": "keep", "SET": "set", "CHANGE": "change to"}
 
 
 _STYLE = """
@@ -494,11 +501,70 @@ def _ledger(name, stats):
     )
 
 
-def render_html(report, settings):
+def _recent_section(report, recent, settings):
+    """The last-N-conversations verdict: is the setting in force paying off.
+
+    Reads ``ttl.recent_heading`` / ``recent_advice`` / ``recent_notes`` — the
+    same functions the terminal head calls — so this section and the terminal
+    report can never disagree about the verdict or its wording.
+    """
+    title, suffix = ttl.recent_heading(report, recent)
+    advice = ttl.recent_advice(recent, settings)
+
+    rows = []
+    for name in (ttl.BUCKET_MAIN, ttl.BUCKET_OTHER):
+        value, _source = settings.get(name, (None, "unknown"))
+        a = advice[name]
+        if a["action"] == "NO DATA":
+            verdict_html = '<span class="mono" style="color:var(--carry)">no data</span>'
+            margin_html = ""
+        else:
+            colour = _ADVICE_COLOUR[a["action"]]
+            verdict_html = '<span class="mono" style="color:var(--%s)">%s %s</span>' % (
+                colour, _esc(_ADVICE_WORD[a["action"]]), _esc(a["to"])
+            )
+            margin_html = "cheaper by %s" % _esc(_millions(a["margin_tokens"]))
+            if a["flip_factor"]:
+                margin_html += "; flips at %.2f&times;" % a["flip_factor"]
+                if a["confidence"]:
+                    margin_html += " (%s)" % _esc(a["confidence"])
+        rows.append(
+            "<tr><td>%s</td><td class=\"num\">set %s</td><td>%s</td><td class=\"num\">%s</td></tr>"
+            % (_esc(name.capitalize()), _esc(value or "unset"), verdict_html, margin_html)
+        )
+
+    notes_html = "".join(
+        '<p class="note">%s%s.</p>' % (_esc(note)[:1].upper(), _esc(note)[1:])
+        for note in ttl.recent_notes(report, recent, settings)
+    )
+
+    return (
+        '<section>\n'
+        '  <div class="sec-head">\n'
+        '    <p class="eyebrow">%s</p>\n'
+        "    <h2>Is the setting in force paying off lately</h2>\n"
+        '    <p class="note">%s. No time cutoff &mdash; the sessions themselves are the window.</p>\n'
+        "  </div>\n"
+        '  <table class="rates">\n'
+        "    <thead><tr><th>Bucket</th><th>Set to</th><th>Verdict</th><th>Margin</th></tr></thead>\n"
+        "    <tbody>%s</tbody>\n"
+        "  </table>\n"
+        "  %s\n"
+        "</section>\n"
+    ) % (
+        _esc(title.lower()),
+        _esc(suffix[:1].upper() + suffix[1:]),
+        "".join(rows),
+        notes_html,
+    )
+
+
+def render_html(report, settings, recent=None):
     """Return the whole page as one HTML string.
 
-    Takes what ``ttl.measure`` and ``ttl.current_settings`` return, so the page
-    cannot disagree with the terminal report. Buckets with no requests render a
+    Takes what ``ttl.measure`` and ``ttl.current_settings`` return, plus
+    (optionally) what ``ttl.measure_recent`` returns, so the page cannot
+    disagree with the terminal report. Buckets with no requests render a
     short placeholder rather than being dropped, because a missing section reads
     as a bug rather than as a quiet window.
     """
@@ -516,6 +582,10 @@ def render_html(report, settings):
         '  <p class="thesis">You pay the one-hour premium on <b>everything you write</b>. '
         "You earn it back only on <b>what survives a break</b>.</p>",
         "</header>",
+    ]
+    if recent is not None:
+        body.append(_recent_section(report, recent, settings))
+    body.extend([
         "<section>",
         '  <div class="sec-head"><p class="eyebrow">your answer</p>'
         "<h2>Two settings, measured separately</h2>"
@@ -523,7 +593,7 @@ def render_html(report, settings):
         "workflows, compaction and title generation are all &ldquo;everything else&rdquo;, and "
         "that pool behaves nothing like a conversation.</p></div>",
         '  <div class="answers">',
-    ]
+    ])
     for name in (ttl.BUCKET_MAIN, ttl.BUCKET_OTHER):
         stats = report["buckets"][name]
         value, source = settings.get(name, (None, "unknown"))

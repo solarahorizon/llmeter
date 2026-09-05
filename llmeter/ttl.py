@@ -52,6 +52,7 @@ Run it::
     python3 -m llmeter.ttl --html            # report and the page
     python3 -m llmeter.ttl --html --quiet    # the page only
     python3 -m llmeter.ttl --days 30
+    python3 -m llmeter.ttl --sessions 5
     python3 -m llmeter.ttl --json
 """
 
@@ -270,6 +271,35 @@ def _group_by_chain(requests, parent_of):
     return list(groups.values())
 
 
+def conversations_with_session(projects_dir):
+    """Like ``conversations``, but tagged with the session each group belongs to.
+
+    A main-conversation group's session is its own transcript file. A sidechain
+    group's session is the file it was inlined in. A subagent file's session is
+    the session-id segment of its own path. Yields (session_id, bucket,
+    list-of-requests) — ``conversations`` is this with the session_id dropped.
+    """
+    session_files = glob.glob(os.path.join(projects_dir, "*", "*.jsonl"))
+    subagent_files = glob.glob(os.path.join(projects_dir, "*", "*", "subagents", "*.jsonl"))
+
+    for path in sorted(session_files):
+        session_id = os.path.splitext(os.path.basename(path))[0]
+        main, side = [], []
+        for request in _requests_in(path):
+            (side if request.sidechain else main).append(request)
+        if main:
+            yield session_id, BUCKET_MAIN, main
+        if side:
+            for group in _group_by_chain(side, _parent_links(path)):
+                yield session_id, BUCKET_OTHER, group
+
+    for path in sorted(subagent_files):
+        session_id = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        requests = list(_requests_in(path))
+        if requests:
+            yield session_id, BUCKET_OTHER, requests
+
+
 def conversations(projects_dir):
     """Group every request into the conversation whose cache prefix it shares.
 
@@ -277,23 +307,8 @@ def conversations(projects_dir):
     Gaps only mean something inside a conversation, so they are never measured
     across this boundary. Yields (bucket, list-of-requests).
     """
-    session_files = glob.glob(os.path.join(projects_dir, "*", "*.jsonl"))
-    subagent_files = glob.glob(os.path.join(projects_dir, "*", "*", "subagents", "*.jsonl"))
-
-    for path in sorted(session_files):
-        main, side = [], []
-        for request in _requests_in(path):
-            (side if request.sidechain else main).append(request)
-        if main:
-            yield BUCKET_MAIN, main
-        if side:
-            for group in _group_by_chain(side, _parent_links(path)):
-                yield BUCKET_OTHER, group
-
-    for path in sorted(subagent_files):
-        requests = list(_requests_in(path))
-        if requests:
-            yield BUCKET_OTHER, requests
+    for _session_id, bucket, requests in conversations_with_session(projects_dir):
+        yield bucket, requests
 
 
 def _delta_write_samples(requests):
@@ -353,6 +368,49 @@ def measure(projects_dir=None, days=14, now=None):
     for name in (BUCKET_MAIN, BUCKET_OTHER):
         buckets[name] = _score(_new_bucket(name), grouped[name])
     return {"window_days": days, "generated_at": now, "buckets": buckets}
+
+
+def measure_recent(projects_dir=None, sessions=10, now=None):
+    """Measure W, G and the verdict over your most recent conversations.
+
+    A session is one main-conversation transcript holding at least one
+    non-sidechain request. The ``sessions`` whose LAST request lands latest are
+    picked, with no time cutoff — the session set itself is the window.
+    "Everything else" is the sidechain and subagent traffic that belongs to
+    those same sessions, so both buckets describe one coherent slice of
+    history. Same shape as ``measure()``, plus ``sessions`` (requested) and
+    ``sessions_found`` (main-conversation sessions that actually exist).
+    """
+    projects_dir = projects_dir or DEFAULT_PROJECTS_DIR
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+
+    by_session = {}
+    last_main_at = {}
+    for session_id, bucket, requests in conversations_with_session(projects_dir):
+        by_session.setdefault(session_id, {BUCKET_MAIN: [], BUCKET_OTHER: []})[bucket].append(requests)
+        if bucket == BUCKET_MAIN:
+            latest = max(r.when for r in requests)
+            last_main_at[session_id] = max(latest, last_main_at.get(session_id, latest))
+
+    ranked = sorted(last_main_at.items(), key=lambda pair: pair[1], reverse=True)
+    chosen = [session_id for session_id, _when in ranked[:sessions]]
+
+    grouped = {BUCKET_MAIN: [], BUCKET_OTHER: []}
+    for session_id in chosen:
+        for name in (BUCKET_MAIN, BUCKET_OTHER):
+            for requests in by_session[session_id][name]:
+                grouped[name].append(sorted(requests, key=lambda r: r.when))
+
+    buckets = {}
+    for name in (BUCKET_MAIN, BUCKET_OTHER):
+        buckets[name] = _score(_new_bucket(name), grouped[name])
+    return {
+        "window_days": None,
+        "generated_at": now,
+        "buckets": buckets,
+        "sessions": sessions,
+        "sessions_found": len(last_main_at),
+    }
 
 
 def _score(stats, conversation_list):
@@ -504,6 +562,108 @@ def current_settings(settings_path=None, environ=None):
     return result
 
 
+# A flip factor this close to 1.0 is the coin toss the README already calls
+# it — a reading hint on top of the verdict, not part of deciding it.
+THIN_FLIP_FACTOR = 1.25
+
+
+def advise(stats, value):
+    """What to do about one bucket's setting, given its measured verdict.
+
+    ``stats`` is one bucket from ``measure()`` / ``measure_recent()``; ``value``
+    is that bucket's current setting ("5m", "1h", or None). Returns a dict with
+    ``action`` (KEEP/CHANGE/SET/NO DATA), ``to`` (the verdict lifetime, or None
+    for NO DATA), ``margin_tokens`` (the delta's absolute size), ``flip_factor``
+    and ``confidence`` ("thin" below ``THIN_FLIP_FACTOR``, "clear" at or above
+    it, None when there is no flip factor to read).
+    """
+    verdict = stats["verdict"]
+    if verdict is None:
+        return {"action": "NO DATA", "to": None, "margin_tokens": None,
+                "flip_factor": None, "confidence": None}
+    flip_factor = stats["flip_factor"]
+    if flip_factor is None:
+        confidence = None
+    else:
+        confidence = "thin" if flip_factor < THIN_FLIP_FACTOR else "clear"
+    if value is None:
+        action = "SET"
+    elif value == verdict:
+        action = "KEEP"
+    else:
+        action = "CHANGE"
+    return {
+        "action": action,
+        "to": verdict,
+        "margin_tokens": abs(stats["delta"]),
+        "flip_factor": flip_factor,
+        "confidence": confidence,
+    }
+
+
+def _bucket_phrase(name):
+    return "the main conversation" if name == BUCKET_MAIN else name
+
+
+def recent_heading(report, recent):
+    """("YOUR LAST N CONVERSATIONS", detail-suffix) for the head section.
+
+    The suffix names how many main-conversation sessions exist in the 14-day
+    ``report`` when enough exist to fill the request; otherwise it says how
+    many were found at all, so the heading never implies sessions that aren't
+    there.
+    """
+    if recent["sessions_found"] < recent["sessions"]:
+        n = recent["sessions_found"]
+        suffix = "only %d found" % n
+    else:
+        n = recent["sessions"]
+        suffix = "of %d in the last %d days" % (
+            report["buckets"][BUCKET_MAIN]["conversations"], report["window_days"]
+        )
+    return "YOUR LAST %d CONVERSATIONS" % n, suffix
+
+
+def recent_advice(recent, settings):
+    """``advise()`` for both buckets of a ``measure_recent()`` result."""
+    result = {}
+    for name in (BUCKET_MAIN, BUCKET_OTHER):
+        value, _source = settings.get(name, (None, "unknown"))
+        result[name] = advise(recent["buckets"][name], value)
+    return result
+
+
+def recent_notes(report, recent, settings):
+    """Sentences where the last-N view disagrees with the 14-day one or the
+    setting actually in force.
+
+    Shared by the terminal head and the HTML head so the two pages can never
+    say something different about the same measurement.
+    """
+    notes = []
+    for name in (BUCKET_MAIN, BUCKET_OTHER):
+        stats_14d = report["buckets"][name]
+        stats_recent = recent["buckets"][name]
+        if (stats_14d["verdict"] and stats_recent["verdict"]
+                and stats_14d["verdict"] != stats_recent["verdict"]):
+            notes.append(
+                "over %d days %s lands on %s; the recent sessions are what "
+                "your setting is actually doing"
+                % (report["window_days"], _bucket_phrase(name), stats_14d["verdict"])
+            )
+        value, _source = settings.get(name, (None, "unknown"))
+        share = stats_recent.get("observed_1h_share")
+        if value in ("5m", "1h") and share is not None:
+            actual = "1h" if share >= 0.5 else "5m"
+            if actual != value:
+                pct = share * 100 if actual == "1h" else (1 - share) * 100
+                notes.append(
+                    "%.0f%% of recent writes still landed on the %s cache; "
+                    "sessions started before the setting changed" % (pct, actual)
+                )
+    return notes
+
+
 def _millions(tokens):
     return "%.1fM" % (tokens / 1e6)
 
@@ -522,11 +682,62 @@ def _row(label, value, note=""):
     return (body + note).rstrip()
 
 
-def render(report, settings=None):
-    """Format a measurement as the terminal report."""
+_ADVICE_LABEL_WIDTH, _ADVICE_SET_WIDTH, _ADVICE_ARROW_WIDTH = 19, 10, 16
+
+
+def _advice_row(name, value, advice):
+    """One head-section line: bucket, setting, verb, margin — same columns as
+    ``_row``, sized for the wider bucket names and verdict verbs this row carries.
+    """
+    set_part = "set %s" % (value or "unset")
+    if advice["action"] == "NO DATA":
+        arrow = "-> NO DATA"
+    elif advice["action"] == "SET":
+        arrow = "-> SET %s" % advice["to"]
+    elif advice["action"] == "KEEP":
+        arrow = "-> KEEP %s" % advice["to"]
+    else:
+        arrow = "-> CHANGE to %s" % advice["to"]
+    note = ""
+    if advice["margin_tokens"] is not None:
+        note = "cheaper by %s" % _millions(advice["margin_tokens"])
+        if advice["flip_factor"]:
+            note += "; flips at %.2fx" % advice["flip_factor"]
+            if advice["confidence"]:
+                note += " (%s)" % advice["confidence"]
+    return "  %-*s%-*s%-*s%s" % (
+        _ADVICE_LABEL_WIDTH, name.upper(),
+        _ADVICE_SET_WIDTH, set_part,
+        _ADVICE_ARROW_WIDTH, arrow,
+        note,
+    )
+
+
+def render(report, settings=None, recent=None):
+    """Format a measurement as the terminal report.
+
+    ``recent`` is a ``measure_recent()`` result. When given, its head — the
+    verdict for the setting actually in force over your last few conversations
+    — prints first, then a divider, then the ``report``'s full-window
+    breakdown. Omitting ``recent`` renders the full-window breakdown alone.
+    """
     settings = settings if settings is not None else current_settings()
     lines = []
     lines.append("llmeter ttl — which prompt-cache lifetime is cheaper for your traffic")
+    lines.append("")
+
+    if recent is not None:
+        title, suffix = recent_heading(report, recent)
+        lines.append("%s  (%s)" % (title, suffix))
+        advice = recent_advice(recent, settings)
+        for name in (BUCKET_MAIN, BUCKET_OTHER):
+            value, _source = settings.get(name, (None, "unknown"))
+            lines.append(_advice_row(name, value, advice[name]))
+        for note in recent_notes(report, recent, settings):
+            lines.append("  " + note)
+        lines.append("")
+        lines.append("--- detail, last %d days ---" % report["window_days"])
+        lines.append("")
 
     generated = report["generated_at"].astimezone()
     lines.append(
@@ -636,15 +847,37 @@ def render(report, settings=None):
     return "\n".join(lines)
 
 
-def _jsonable(report):
-    hidden = ("read_weighted", "read_weight_base")
+_HIDDEN_STATS_FIELDS = ("read_weighted", "read_weight_base")
+
+
+def _jsonable(report, recent=None, settings=None):
+    """``report`` (and optionally ``recent``) as a JSON-safe dict.
+
+    ``recent``'s buckets each carry an ``advice`` field — ``advise()`` run
+    against ``settings`` — so a JSON consumer gets the same verdict the head
+    section prints, without recomputing it.
+    """
     out = {
         "window_days": report["window_days"],
         "generated_at": report["generated_at"].isoformat(),
-        "buckets": {},
+        "buckets": {
+            name: {k: v for k, v in stats.items() if k not in _HIDDEN_STATS_FIELDS}
+            for name, stats in report["buckets"].items()
+        },
     }
-    for name, stats in report["buckets"].items():
-        out["buckets"][name] = {k: v for k, v in stats.items() if k not in hidden}
+    if recent is not None:
+        settings = settings or {}
+        out["recent"] = {
+            "sessions": recent["sessions"],
+            "sessions_found": recent["sessions_found"],
+            "generated_at": recent["generated_at"].isoformat(),
+            "buckets": {},
+        }
+        for name, stats in recent["buckets"].items():
+            value, _source = settings.get(name, (None, "unknown"))
+            view = {k: v for k, v in stats.items() if k not in _HIDDEN_STATS_FIELDS}
+            view["advice"] = advise(stats, value)
+            out["recent"]["buckets"][name] = view
     return out
 
 
@@ -654,6 +887,10 @@ def main(argv=None):
         description="Recommend promptCacheTtl / subagentPromptCacheTtl from your own transcripts.",
     )
     parser.add_argument("--days", type=int, default=14, help="window to measure (default 14)")
+    parser.add_argument(
+        "--sessions", type=int, default=10,
+        help="how many of your most recent conversations to lead with (default 10)",
+    )
     parser.add_argument("--projects-dir", default=None, help="override ~/.claude/projects")
     parser.add_argument("--json", action="store_true", help="emit the measurement as JSON")
     parser.add_argument(
@@ -684,18 +921,19 @@ def main(argv=None):
         return 1
 
     report = measure(projects_dir=projects_dir, days=args.days)
+    recent = measure_recent(projects_dir=projects_dir, sessions=args.sessions)
     settings = current_settings()
     if args.json:
-        print(json.dumps(_jsonable(report), indent=2))
+        print(json.dumps(_jsonable(report, recent, settings), indent=2))
     elif not args.quiet:
-        print(render(report, settings))
+        print(render(report, settings, recent))
 
     if args.html:
         # Imported here so the default run never pays for the page's markup, and
         # so the module holding it can import this one without a cycle.
         from llmeter import ttl_report
 
-        page = ttl_report.render_html(report, settings)
+        page = ttl_report.render_html(report, settings, recent)
         try:
             with open(args.html, "w", encoding="utf-8") as handle:
                 handle.write(page)
