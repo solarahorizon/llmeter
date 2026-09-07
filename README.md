@@ -76,6 +76,10 @@ Terminal-independent: works identically under Terminal.app, iTerm2, tmux, VS Cod
 
 Override the location with `LLMETER_DIR`.
 
+If you run Claude Code with `CLAUDE_CONFIG_DIR` set, every `~/.claude/…` path
+on this page follows it — llmeter reads the settings and transcripts of the
+config dir Claude Code is actually using, and writes beside them.
+
 ### Sessions routed elsewhere
 
 If a project points Claude Code at another endpoint with `ANTHROPIC_BASE_URL`

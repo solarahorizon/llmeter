@@ -765,6 +765,39 @@ class RenderTests(unittest.TestCase):
         self.assertIn("wk 10%", line)
 
 
+class ConfigDirTests(unittest.TestCase):
+    """CLAUDE_CONFIG_DIR moves Claude Code's config dir; llmeter's files and
+    the transcripts it reads have to move with it."""
+
+    def test_defaults_to_dot_claude_under_home(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(core.config_dir(),
+                             os.path.join(os.path.expanduser("~"), ".claude"))
+
+    def test_env_var_wins_when_populated(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/opt/cc"}):
+            self.assertEqual(core.config_dir(), "/opt/cc")
+
+    def test_empty_or_blank_env_var_falls_back(self):
+        # Set-but-empty is not "populated" — an exported-then-cleared var must
+        # not send llmeter to a path of "/llmeter".
+        home = os.path.join(os.path.expanduser("~"), ".claude")
+        for value in ("", "   "):
+            with self.subTest(value=value):
+                with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": value}):
+                    self.assertEqual(core.config_dir(), home)
+
+    def test_ttl_defaults_follow_the_config_dir(self):
+        import importlib
+
+        from llmeter import ttl
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/opt/cc"}):
+            importlib.reload(ttl)
+            self.assertEqual(ttl.DEFAULT_PROJECTS_DIR, "/opt/cc/projects")
+            self.assertEqual(ttl.DEFAULT_SETTINGS_PATH, "/opt/cc/settings.json")
+        importlib.reload(ttl)  # restore the module for any later import
+
+
 class MainTests(unittest.TestCase):
     def setUp(self):
         d = tempfile.mkdtemp(prefix="llmeter-main-")

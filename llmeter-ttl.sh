@@ -1,10 +1,11 @@
 #!/usr/bin/env zsh
 # llmeter ttl — recommend a prompt-cache lifetime from your own transcripts.
 #
-# Reads ~/.claude/projects offline and prints which of Claude Code's two cache
-# TTLs is cheaper for the way you actually work, per setting. No network. It
-# writes nothing unless --html asks for a page, and then only that page, into
-# the directory you run it from. Run it by hand whenever you want the number.
+# Reads ~/.claude/projects (or $CLAUDE_CONFIG_DIR/projects) offline and prints
+# which of Claude Code's two cache TTLs is cheaper for the way you actually
+# work, per setting. No network. It writes nothing unless --html asks for a
+# page, and then only that page, into the directory you run it from. Run it by
+# hand whenever you want the number.
 #
 #   ./llmeter-ttl.sh              # last 14 days
 #   ./llmeter-ttl.sh --days 30

@@ -16,7 +16,15 @@ set -eu
 
 REPO="${0:A:h}"
 WRAPPER="$REPO/llmeter-statusline.sh"
-SETTINGS="${LLMETER_SETTINGS:-${HOME:?llmeter: set HOME or LLMETER_SETTINGS}/.claude/settings.json}"
+# Claude Code's config dir: CLAUDE_CONFIG_DIR when it is set to a non-empty
+# value, else ~/.claude. Resolved the way the host resolves it, so we read and
+# write the same settings.json Claude Code does.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  CONFIG_DIR="$CLAUDE_CONFIG_DIR"
+else
+  CONFIG_DIR="${HOME:?llmeter: set HOME, CLAUDE_CONFIG_DIR or LLMETER_SETTINGS}/.claude"
+fi
+SETTINGS="${LLMETER_SETTINGS:-$CONFIG_DIR/settings.json}"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "llmeter: python3 not found on PATH — it is required to run the status line." >&2
@@ -107,5 +115,5 @@ PY
 echo ""
 echo "llmeter installed. Start a new Claude Code session (or send a message) and"
 echo "look under the prompt for:  <model> · ctx N% · wk N% (resets …)"
-echo "Verify the capture:  cat ${LLMETER_DIR:-$HOME/.claude/llmeter}/usage-snapshot.json"
+echo "Verify the capture:  cat ${LLMETER_DIR:-$CONFIG_DIR/llmeter}/usage-snapshot.json"
 echo "Uninstall:  $REPO/uninstall.sh"
