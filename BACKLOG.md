@@ -5,6 +5,26 @@ Adapter work per CLI is tracked in `docs/ROADMAP.md`; this file holds defects an
 
 ## Defects
 
+- [ ] **A history row can carry a `session_id` no consumer can join on, beside a
+  `live_sessions` key omitted on the grounds there was no usable id.** `write_snapshot` copies
+  `snap["session_id"]` into the row through `_HISTORY_DETAIL_FIELDS`, dropping only `None`.
+  `_session_id` rejects a non-string or empty id and returns `None`, but the Claude Code adapter's
+  `parse` passes the host's `session_id` through raw, so `""`, `7` or `[]` reach `snap` and then the
+  row. Such a row names a publisher that cannot be looked up **and** omits `live_sessions`, because
+  the omission is keyed on `fp is None` — the two keys then disagree about whether the publisher was
+  identifiable. Seen on a constructed payload during the `feat/history-session-detail` review
+  (2026-09-10), not on a real record; the reviewer classed it a frame observation and left it
+  unresolved. Candidate fix: run the row's `session_id` through the same validity test the map uses,
+  so one predicate decides both keys. · source: session 2026-09-10 · small
+
+- [ ] **`_live_session_count` and `_prune_sessions` disagree about future-dated entries.** The count
+  uses `abs((now_dt - at_dt).total_seconds()) <= LIVE_SESSION_SECS`, which is deliberate clock-skew
+  tolerance and is documented, so a peer up to 5 minutes ahead counts as live. The prune is one-sided
+  (`> 24*3600`), so an entry dated far in the future never ages out of the session map at all, while
+  counting as live only inside the ±300s window. A badly-skewed peer therefore occupies the map
+  indefinitely. No real record shows this; a clock more than 24h fast is the trigger. Candidate fix:
+  make the prune symmetric on the same tolerance the count uses. · source: session 2026-09-10 · small
+
 - [ ] **An idle pane renders its own stale caps after another pane has landed a reset
   (`render_prefers_stale_caps_after_reset`).** `format_line` prefers the reading's own `rate_limits`
   over the snapshot's. After the weekly reset (88 → 8) a pane that has had no API response since
