@@ -529,6 +529,96 @@ class HarvestTests(unittest.TestCase):
         self._write(moved)
         self.assertEqual(len(_lines(self.hist)), 2)
 
+    def test_history_row_names_the_session_that_moved_the_cap(self):
+        # The caps alone answer "the number moved"; a retrospective consumer
+        # also needs "which pane, on which model, at what context size".
+        self._write(PAYLOAD)
+        row = json.loads(_lines(self.hist)[0])
+        self.assertEqual(row["session_id"], "s-1")
+        self.assertEqual(row["model"], "Fable 5")
+        self.assertEqual(row["caps"]["seven_day"]["used_percentage"], 10.0)
+        self.assertEqual(row["provider"], "anthropic")
+
+    def test_history_row_carries_context_size_when_the_host_reports_it(self):
+        payload = json.loads(json.dumps(PAYLOAD))
+        payload["context_window"]["total_input_tokens"] = 205_600
+        payload["context_window"]["context_window_size"] = 1_000_000
+        self._write(payload)
+        row = json.loads(_lines(self.hist)[0])
+        self.assertEqual(row["context_tokens"], 205_600)
+        self.assertEqual(row["context_window_size"], 1_000_000)
+
+    def test_history_row_omits_detail_the_host_did_not_report(self):
+        # The adapter reports every field it knows about and nulls the ones
+        # this host omitted. A row drops those rather than writing a null a
+        # consumer would have to tell apart from a real zero.
+        self._write(PAYLOAD)   # no context_window token counts in this payload
+        row = json.loads(_lines(self.hist)[0])
+        self.assertNotIn("context_tokens", row)
+        self.assertNotIn("context_window_size", row)
+
+    def test_history_row_counts_sessions_live_at_that_moment(self):
+        # Two panes publishing within the liveness window are two live
+        # sessions on the row the second one writes.
+        self._write(PAYLOAD, now="2026-07-03T22:40:00+10:00")
+        second = json.loads(json.dumps(PAYLOAD))
+        second["session_id"] = "s-2"
+        second["rate_limits"]["seven_day"]["used_percentage"] = 11.0
+        self._write(second, now="2026-07-03T22:41:00+10:00")
+        rows = [json.loads(l) for l in _lines(self.hist)]
+        self.assertEqual(rows[0]["live_sessions"], 1)
+        self.assertEqual(rows[1]["live_sessions"], 2)
+        self.assertEqual(rows[1]["session_id"], "s-2")
+
+    def test_history_live_count_drops_a_session_that_went_quiet(self):
+        # Past LIVE_SESSION_SECS the first pane no longer counts, even though
+        # the 24h session map still carries it.
+        self._write(PAYLOAD, now="2026-07-03T22:40:00+10:00")
+        later = json.loads(json.dumps(PAYLOAD))
+        later["session_id"] = "s-2"
+        later["rate_limits"]["seven_day"]["used_percentage"] = 12.0
+        stamp = "2026-07-03T23:40:00+10:00"   # one hour on
+        self._write(later, now=stamp)
+        row = json.loads(_lines(self.hist)[-1])
+        self.assertEqual(row["live_sessions"], 1)
+        self.assertIn("s-1", _json(self.snap)["sessions"])
+
+    def test_history_row_omits_the_count_when_there_is_no_session_id(self):
+        # Without an id this publisher is not in the session map, so a count
+        # would read 0 on a row a live session just wrote. Omitted instead.
+        reading = claude_code.parse(PAYLOAD)
+        reading["session_id"] = None
+        core.write_snapshot(reading, self.snap, self.hist)
+        row = json.loads(_lines(self.hist)[0])
+        self.assertNotIn("live_sessions", row)
+        self.assertNotIn("session_id", row)
+        self.assertEqual(row["caps"]["seven_day"]["used_percentage"], 10.0)
+
+    def test_live_session_count_survives_hostile_session_maps(self):
+        # Ground rule 2: a hostile or legacy shape must still return a number
+        # rather than break the host tool's prompt.
+        now = datetime.datetime(2026, 7, 3, 22, 40,
+                                tzinfo=datetime.timezone.utc)
+        for hostile in (None, "not-a-dict", [], 7,
+                        {"s": "not-a-dict"},
+                        {"s": {"at": None}},
+                        {"s": {"at": "not-a-timestamp"}},
+                        {"s": {}}):
+            self.assertEqual(core._live_session_count(hostile, now), 0)
+        fresh = {"s": {"fp": "x", "at": now.isoformat()}}
+        self.assertEqual(core._live_session_count(fresh, now), 1)
+
+    def test_history_row_persists_no_field_outside_the_allowlist(self):
+        # CONTRIBUTING ground rule 3 applies to the history log too, not just
+        # the snapshot: a rogue Reading field reaches neither file.
+        reading = claude_code.parse(PAYLOAD)
+        reading["rogue_field"] = {"account_email": "leak@example.com"}
+        core.write_snapshot(reading, self.snap, self.hist)
+        row = json.loads(_lines(self.hist)[0])
+        allowed = set(core._HISTORY_DETAIL_FIELDS) | {
+            "captured_at", "provider", "caps", "live_sessions"}
+        self.assertEqual(set(row) - allowed, set())
+
     def test_no_caps_is_noop(self):
         # A payload with no rate_limits persists nothing (first-message case).
         self.assertIsNone(self._write({"model": {"id": "x"}}))
