@@ -244,6 +244,20 @@ _SNAPSHOT_FIELDS = ("source", "model", "context_pct", "context_tokens",
 # pasting a snapshot into a bug report — see CONTRIBUTING.
 _STAMPED_FIELDS = ("captured_at", "provider")
 
+# The Reading fields a history row carries beyond the caps themselves. Every
+# member is already on ``_SNAPSHOT_FIELDS``, so history widens what a row
+# ANSWERS without widening what reaches disk. They turn the log from "the cap
+# moved" into "the cap moved, and this session on this model moved it", which
+# is what a retrospective consumer needs to attribute a burn to a pane.
+_HISTORY_DETAIL_FIELDS = ("session_id", "model", "context_tokens",
+                          "context_window_size")
+
+# How recently a session must have published to count as live in a history
+# row's ``live_sessions``. A pane counts only while it is still rendering its
+# status line, and drops out within one window once it stops — so the number
+# is "panes that rendered inside this window", never "panes that are open".
+LIVE_SESSION_SECS = 300
+
 # What a session's republish fingerprint hashes: every persisted Reading field
 # except the key of the map itself and the map core writes.
 _FINGERPRINT_FIELDS = tuple(k for k in _SNAPSHOT_FIELDS
@@ -303,6 +317,30 @@ def _prune_sessions(sessions, now_dt):
     return kept
 
 
+def _live_session_count(sessions, now_dt):
+    """How many entries in a pruned session map published within
+    ``LIVE_SESSION_SECS`` of ``now_dt``. Concurrency at the moment a cap moved,
+    which a per-row session id alone cannot give: one row names one publisher,
+    this names how many panes were competing for the same cap. Entries are
+    already shape-checked by ``_prune_sessions``; an unparseable ``at`` here is
+    still skipped rather than counted."""
+    sessions = sessions if isinstance(sessions, dict) else {}
+    live = 0
+    for entry in sessions.values():
+        at = entry.get("at") if isinstance(entry, dict) else None
+        if not isinstance(at, str):
+            continue
+        try:
+            at_dt = datetime.datetime.fromisoformat(at)
+        except ValueError:
+            continue
+        if at_dt.tzinfo is None:
+            at_dt = at_dt.astimezone()
+        if abs((now_dt - at_dt).total_seconds()) <= LIVE_SESSION_SECS:
+            live += 1
+    return live
+
+
 def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     """Persist a normalized Reading. Returns the stored snapshot dict, or None
     if the reading carries no account-level usage worth persisting (e.g. a
@@ -321,7 +359,10 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     - Write is atomic (tmp + os.replace) so a concurrent reader never sees a
       torn file — multiple CLI panes may write these same files at once.
     - History appends one line only when a cap percentage actually changes
-      (the change-log a retrospective consumer joins against).
+      (the change-log a retrospective consumer joins against). The line carries
+      the caps plus ``_HISTORY_DETAIL_FIELDS`` and a ``live_sessions`` count,
+      so a row says which session on which model moved the cap and how many
+      sessions were live at that moment.
     - Snapshots are per-provider: a session routed at another account writes
       its own file and merges only against that file, so one account's cap can
       never be folded into another's.
@@ -369,24 +410,39 @@ def write_snapshot(reading, snapshot_path=None, history_path=None, now=None):
     # Unconditional: {} is safer than leaving a hostile non-dict "caps" from
     # the raw reading in the snapshot.
     snap["caps"] = _merge_caps((prev or {}).get("caps"), snap.get("caps"))
-    # History logs the MERGED truth: a stale session re-publishing old numbers
-    # merges to no-change and appends nothing (no more flapping in the log).
-    if _caps_changed((prev or {}).get("caps"), snap.get("caps")):
-        try:
-            with open(history_path, "a") as f:
-                f.write(json.dumps({"captured_at": snap["captured_at"],
-                                    "provider": provider,
-                                    "caps": snap.get("caps") or {}}) + "\n")
-        except OSError:
-            pass
-
     # This reading's fingerprint is the one future republishes from the same
     # session will be compared against; other sessions' entries carry over
-    # untouched except for the 24h prune.
+    # untouched except for the 24h prune. Built before the history append so a
+    # row can report the concurrency that INCLUDES this publisher.
     if fp is not None:
         prev_sessions = dict(prev_sessions)
         prev_sessions[sid] = {"fp": fp, "at": captured_at}
     snap["sessions"] = _prune_sessions(prev_sessions, now_dt)
+
+    # History logs the MERGED truth: a stale session re-publishing old numbers
+    # merges to no-change and appends nothing (no more flapping in the log).
+    if _caps_changed((prev or {}).get("caps"), snap.get("caps")):
+        row = {"captured_at": snap["captured_at"],
+               "provider": provider,
+               "caps": snap.get("caps") or {}}
+        for key in _HISTORY_DETAIL_FIELDS:
+            # None is dropped, not written: an adapter reports every field it
+            # knows about and leaves the ones the host omitted null, so writing
+            # them would leave a consumer unable to tell "not reported" from a
+            # real zero without re-reading the adapter.
+            if snap.get(key) is not None:
+                row[key] = snap[key]
+        if fp is not None:
+            # Without a usable session id this publisher is not in the map, so
+            # the count would read 0 on a row a live session just wrote. Omit
+            # it, the way a detail field the host did not report is omitted.
+            row["live_sessions"] = _live_session_count(snap["sessions"], now_dt)
+        try:
+            with open(history_path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+        except OSError:
+            pass
+
     _write_atomic(snapshot_path, snap)
     return snap
 

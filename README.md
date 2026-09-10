@@ -76,6 +76,34 @@ Terminal-independent: works identically under Terminal.app, iTerm2, tmux, VS Cod
 
 Override the location with `LLMETER_DIR`.
 
+### A history row
+
+Each line says the cap moved, which session moved it, and how crowded the
+account was at that moment:
+
+```json
+{"captured_at": "2026-09-10T08:19:13+10:00",
+ "provider": "anthropic",
+ "caps": {"seven_day": {"used_percentage": 43, "resets_at": 1789516800},
+          "five_hour": {"used_percentage": 11, "resets_at": 1789025400}},
+ "session_id": "9dffbc6b-9171-4a90-a1dc-c38ecfe6f665",
+ "model": "Opus 5",
+ "context_tokens": 74429,
+ "context_window_size": 1000000,
+ "live_sessions": 3}
+```
+
+`live_sessions` counts the panes that rendered a status line within the last
+five minutes, this one included. It is what separates "the week moved 21
+points" from "the week moved 21 points while three sessions ran side by side".
+A field the host did not report is left out rather than written as `null`, and
+`live_sessions` itself is left out when the host reports no session id, since
+this publisher could not be counted.
+
+Two panes publishing in the same instant each read the file before either
+writes, so under heavy concurrency the count can read one low. It is a floor,
+not an exact census.
+
 If you run Claude Code with `CLAUDE_CONFIG_DIR` set, every `~/.claude/…` path
 on this page follows it — llmeter reads the settings and transcripts of the
 config dir Claude Code is actually using, and writes beside them.
